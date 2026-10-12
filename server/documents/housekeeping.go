@@ -23,6 +23,7 @@ import (
 	"github.com/yorkie-team/yorkie/server/backend"
 	"github.com/yorkie-team/yorkie/server/backend/database"
 	"github.com/yorkie-team/yorkie/server/logging"
+	"github.com/yorkie-team/yorkie/server/packs"
 )
 
 const (
@@ -33,6 +34,21 @@ const (
 type CandidatePairDoc struct {
 	Project  *types.Project
 	Document *database.DocInfo
+}
+
+// RecoverCompactions resumes compaction generations interrupted by a crash
+// or an uncertain response, and reclaims candidates of documents that no
+// longer exist. It runs ahead of candidate selection on every housekeeping
+// cycle; all stages are idempotent.
+func RecoverCompactions(ctx context.Context, be *backend.Backend) (int, error) {
+	recovered, err := packs.RecoverActiveCompactions(ctx, be)
+	if err != nil {
+		return 0, err
+	}
+	if recovered > 0 {
+		logging.From(ctx).Infof("HSKP: recovered %d interrupted compaction(s)", recovered)
+	}
+	return recovered, nil
 }
 
 // CompactDocuments compacts documents by removing old changes and creating
@@ -50,6 +66,12 @@ func CompactDocuments(
 		return lastServerSeq, lastDocID, 0, 0, nil
 	}
 	defer locker.Unlock()
+
+	// Finish interrupted generations before selecting new candidates, so a
+	// document is never compacted twice and a failed candidate is reclaimed.
+	if _, err := RecoverCompactions(ctx, be); err != nil {
+		logging.From(ctx).Warnf("recover interrupted compactions: %v", err)
+	}
 
 	resultServerSeq, resultDocID, candidates, err := FindCompactionCandidates(
 		ctx,

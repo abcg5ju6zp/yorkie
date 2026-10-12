@@ -20,15 +20,14 @@ package integration
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
-	"strings"
 	"testing"
 
-	"connectrpc.com/connect"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/yorkie-team/yorkie/api/converter"
 	"github.com/yorkie-team/yorkie/client"
 	"github.com/yorkie-team/yorkie/pkg/document"
 	"github.com/yorkie-team/yorkie/pkg/document/json"
@@ -89,7 +88,7 @@ func TestDocumentCompaction(t *testing.T) {
 		assert.Equal(t, len(cloneRootText), len(rootText))
 	})
 
-	t.Run("force compaction on attached document test", func(t *testing.T) {
+	t.Run("non-force compaction refuses an attached document test", func(t *testing.T) {
 		ctx := context.Background()
 
 		d1 := document.New(helper.TestKey(t))
@@ -104,26 +103,19 @@ func TestDocumentCompaction(t *testing.T) {
 		assert.NoError(t, c1.Sync(ctx))
 
 		// Without force: should fail because document is attached.
-		// server.go calls packs.Compact directly (not via cluster service),
-		// so ErrDocumentAttached is returned as-is.
 		err := defaultServer.CompactDocument(ctx, d1.Key(), false)
 		assert.Error(t, err)
 		assert.True(t, errors.Is(err, packs.ErrDocumentAttached))
 
-		// Force compact while attached: should succeed
+		// Force compact while attached succeeds and the client keeps working.
 		assert.NoError(t, defaultServer.CompactDocument(ctx, d1.Key(), true))
-
-		// NOTE: After force compaction, the server resets serverSeq and
-		// increments epoch, but detach still succeeds because the server
-		// skips change sync for detach operations with epoch mismatch.
+		assert.NoError(t, c1.Sync(ctx))
 		assert.NoError(t, c1.Detach(ctx, d1))
 	})
 
-	t.Run("same client recovers from epoch mismatch by detach and reattach", func(t *testing.T) {
+	t.Run("attached client keeps syncing through force compaction", func(t *testing.T) {
 		ctx := context.Background()
 
-		// Use a dedicated client to avoid interference from stale attachments
-		// left by previous subtests.
 		c, err := client.Dial(defaultServer.RPCAddr())
 		assert.NoError(t, err)
 		assert.NoError(t, c.Activate(ctx))
@@ -142,34 +134,33 @@ func TestDocumentCompaction(t *testing.T) {
 		}))
 		assert.NoError(t, c.Sync(ctx))
 
-		// Force compact while client is attached
+		// Force compact while the client is attached.
 		assert.NoError(t, defaultServer.CompactDocument(ctx, d1.Key(), true))
 
-		// Sync fails with epoch mismatch
-		err = c.Sync(ctx)
-		assert.Equal(t, connect.CodeFailedPrecondition, connect.CodeOf(err))
-		assert.Equal(t, "ErrEpochMismatch", converter.ErrorCodeOf(err))
+		// The same client keeps syncing on the same epoch and checkpoint — no
+		// detach/re-attach is needed because the sequence stays monotonic.
+		assert.NoError(t, c.Sync(ctx))
 
-		// Recovery with the same client: detach succeeds even with epoch
-		// mismatch (server skips change sync for detach), then re-attach
-		// with a new document instance to receive the compacted state.
-		assert.NoError(t, c.Detach(ctx, d1))
-
-		d2 := document.New(d1.Key())
-		assert.NoError(t, c.Attach(ctx, d2))
-
-		// Verify the reattached document has the compacted content
-		assert.Equal(t, `hello`, d2.Root().GetText("text").String())
-
-		// Further edits work normally
-		assert.NoError(t, d2.Update(func(r *json.Object, p *presence.Presence) error {
+		// Further edits push on top of the compacted history normally.
+		assert.NoError(t, d1.Update(func(r *json.Object, p *presence.Presence) error {
 			r.GetText("text").Edit(5, 5, " world")
 			return nil
 		}))
 		assert.NoError(t, c.Sync(ctx))
+		assert.Equal(t, "hello world", d1.Root().GetText("text").String())
+
+		assert.NoError(t, c.Detach(ctx, d1))
+
+		// A brand-new client below the published snapshot floor receives the
+		// snapshot rather than a change range with a hole, and converges.
+		d2 := document.New(d1.Key())
+		assert.NoError(t, c2.Attach(ctx, d2))
+		assert.NoError(t, c2.Sync(ctx))
+		assert.Equal(t, "hello world", d2.Root().GetText("text").String())
+		assert.NoError(t, c2.Detach(ctx, d2))
 	})
 
-	t.Run("stale epoch push does not corrupt document for other clients", func(t *testing.T) {
+	t.Run("a client synced before compaction converges after it", func(t *testing.T) {
 		ctx := context.Background()
 
 		d1 := document.New(helper.TestKey(t))
@@ -188,43 +179,54 @@ func TestDocumentCompaction(t *testing.T) {
 
 		assert.NoError(t, defaultServer.CompactDocument(ctx, d1.Key(), true))
 
+		// c2 keeps syncing: its checkpoint is at the pinned point and later
+		// changes are served normally.
 		assert.NoError(t, d2.Update(func(r *json.Object, p *presence.Presence) error {
 			r.GetText("text").Edit(5, 5, " world")
 			return nil
 		}))
-		err := c2.Sync(ctx)
-		assert.Equal(t, connect.CodeFailedPrecondition, connect.CodeOf(err))
-		assert.Equal(t, "ErrEpochMismatch", converter.ErrorCodeOf(err))
+		assert.NoError(t, c2.Sync(ctx))
+		assert.Equal(t, "hello world", d2.Root().GetText("text").String())
 
 		assert.NoError(t, c2.Detach(ctx, d2))
 
 		d3 := document.New(d1.Key())
 		assert.NoError(t, c3.Attach(ctx, d3))
-		assert.Equal(t, `hello`, d3.Root().GetText("text").String())
-
-		assert.NoError(t, c1.Detach(ctx, d1))
+		assert.NoError(t, c3.Sync(ctx))
+		assert.Equal(t, `hello world`, d3.Root().GetText("text").String())
 		assert.NoError(t, c3.Detach(ctx, d3))
+		assert.NoError(t, c1.Detach(ctx, d1))
 	})
 
 	t.Run("compaction over the change size limit keeps the document", func(t *testing.T) {
 		ctx := context.Background()
 
-		// Two pushes of 9MB each: every change fits a request, but the single
-		// change compaction would write does not fit a MongoDB document. The
-		// client's per-document limit is lifted here to grow a document past
-		// what the compacted change can hold; the server's gate admits both
-		// pushes because no snapshot has measured the document yet.
-		chunk := strings.Repeat("a", 9*1024*1024)
+		// Three pushes of 9MB of incompressible text each: every change fits
+		// a request, but the candidate snapshot of the whole document
+		// compresses to more than one MongoDB document can hold. Random bytes
+		// are used because repeated text would compress under the record
+		// limit. The client's per-document limit is lifted here to grow a
+		// document past what compaction can store; the server's gate admits
+		// the pushes because no snapshot has measured the document yet.
+		randomText := func(t *testing.T) string {
+			raw := make([]byte, 6*1024*1024+768*1024)
+			_, err := rand.Read(raw)
+			require.NoError(t, err)
+			return base64.RawStdEncoding.EncodeToString(raw)
+		}
 		d1 := document.New(helper.TestKey(t))
 		assert.NoError(t, c1.Attach(ctx, d1, client.WithInitialRoot(
 			yson.ParseObject(`{"text": Text()}`),
 		)))
 		d1.SetMaxSizeLimit(0)
-		for range 2 {
+		total := 0
+		for range 3 {
+			textChunk := randomText(t)
+			total += len(textChunk)
 			assert.NoError(t, d1.Update(func(r *json.Object, p *presence.Presence) error {
 				text := r.GetText("text")
 				end := len(text.String())
-				text.Edit(end, end, chunk)
+				text.Edit(end, end, textChunk)
 				return nil
 			}))
 			assert.NoError(t, c1.Sync(ctx))
@@ -232,7 +234,7 @@ func TestDocumentCompaction(t *testing.T) {
 		assert.NoError(t, c1.Detach(ctx, d1))
 
 		// Count the stored changes in the database itself: the server keeps
-		// answering from its caches after a purge, which would hide the loss.
+		// answering from its caches after a prune, which would hide the loss.
 		project, err := defaultServer.DefaultProject(ctx)
 		assert.NoError(t, err)
 		docInfo, err := defaultServer.Backend().DB.FindDocInfoByKey(ctx, project.ID, d1.Key())
@@ -262,9 +264,14 @@ func TestDocumentCompaction(t *testing.T) {
 		assert.ErrorIs(t, err, database.ErrChangeTooLarge)
 		assert.ErrorContains(t, err, "skipped")
 
+		// The failed candidate is gone and the last readable snapshot stands.
+		active, err := defaultServer.Backend().DB.FindActiveCompactionInfo(ctx, docInfo.RefKey())
+		assert.NoError(t, err)
+		assert.Nil(t, active)
+
 		d2 := document.New(d1.Key())
 		assert.NoError(t, c2.Attach(ctx, d2))
-		assert.Equal(t, 2*len(chunk), len(d2.Root().GetText("text").String()))
+		assert.Equal(t, total, len(d2.Root().GetText("text").String()))
 		assert.NoError(t, c2.Detach(ctx, d2))
 	})
 }

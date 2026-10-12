@@ -72,8 +72,14 @@ Housekeeping:
   # Set to 0 or 1 to fall back to sequential execution.
   DeactivateConcurrency: 8
 
-  # CompactionMinChanges is minimum number of changes to compact a document. (default: 1000).
+  # CompactionMinChanges is minimum number of changes beyond the published
+  # snapshot floor to compact a document. (default: 1000).
   CompactionMinChanges: 1000
+
+  # DisableCompaction turns automatic housekeeping compaction off. Recovery
+  # of an interrupted compaction and admin-forced compaction stay enabled.
+  # (default: false).
+  DisableCompaction: false
 
 # Backend is the configuration for the backend of Yorkie.
 Backend:

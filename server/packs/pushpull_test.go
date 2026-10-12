@@ -41,6 +41,7 @@ import (
 	"github.com/yorkie-team/yorkie/pkg/document/json"
 	"github.com/yorkie-team/yorkie/pkg/document/presence"
 	"github.com/yorkie-team/yorkie/pkg/document/time"
+	"github.com/yorkie-team/yorkie/pkg/document/yson"
 	"github.com/yorkie-team/yorkie/server/backend"
 	"github.com/yorkie-team/yorkie/server/backend/database"
 	"github.com/yorkie-team/yorkie/server/clients"
@@ -975,7 +976,7 @@ func TestPacks(t *testing.T) {
 		assert.Equal(t, presentedEpoch, resumeClientInfo.Documents[docID].Epoch)
 	})
 
-	t.Run("resume with stale epoch after force compaction re-anchors", func(t *testing.T) {
+	t.Run("force compaction keeps epoch and server seq, offline client resumes test", func(t *testing.T) {
 		ctx := context.Background()
 
 		projectInfo, err := testBackend.DB.FindProjectInfoByID(ctx, database.DefaultProjectID)
@@ -984,13 +985,7 @@ func TestPacks(t *testing.T) {
 
 		docKey := helper.TestKey(t)
 
-		// 01. Create a doc with real root content via a full SDK client, so the
-		// compacted snapshot carries a change and server_seq stays at 1 (a
-		// presence-only change would compact to an empty root at server_seq 0).
-		// Force-compact once so the working epoch is a non-zero value (1): a fresh
-		// doc's epoch is 0, and the presented-epoch seeding treats 0 as "no epoch
-		// presented" (falls back to the current doc epoch), so a non-zero epoch is
-		// needed to exercise the real stale-epoch signal.
+		// 01. A detached client leaves a document with one root change.
 		sdkClient, err := client.Dial(testRPCAddr)
 		assert.NoError(t, err)
 		assert.NoError(t, sdkClient.Activate(ctx))
@@ -1000,70 +995,58 @@ func TestPacks(t *testing.T) {
 		}()
 
 		doc := document.New(docKey)
-		assert.NoError(t, sdkClient.Attach(ctx, doc))
-		assert.NoError(t, doc.Update(func(r *json.Object, p *presence.Presence) error {
-			r.SetString("k", "v")
+		assert.NoError(t, sdkClient.Attach(ctx, doc, client.WithInitialRoot(
+			yson.ParseObject(`{"text": Text()}`),
+		)))
+		assert.NoError(t, doc.Update(func(r *json.Object, _ *presence.Presence) error {
+			r.GetText("text").Edit(0, 0, "v")
 			return nil
 		}))
 		assert.NoError(t, sdkClient.Sync(ctx))
 		assert.NoError(t, sdkClient.Detach(ctx, doc))
 
-		seedDocInfo, err := documents.FindDocInfoByKey(ctx, testBackend, project, docKey)
+		docInfo, err := documents.FindDocInfoByKey(ctx, testBackend, project, docKey)
 		assert.NoError(t, err)
-		docRefKey := seedDocInfo.RefKey()
-		assert.NoError(t, packs.Compact(ctx, testBackend, project.ID, seedDocInfo, true))
+		refKey := docInfo.RefKey()
+		assert.NoError(t, packs.Compact(ctx, testBackend, project.ID, docInfo, true))
 
-		afterFirstCompact, err := documents.FindDocInfoByRefKey(ctx, testBackend, docRefKey)
+		compacted, err := documents.FindDocInfoByRefKey(ctx, testBackend, refKey)
 		assert.NoError(t, err)
-		// The non-zero epoch the offline client persists as its baseline, and the
-		// server_seq the compacted snapshot sits at.
-		staleEpoch := afterFirstCompact.Epoch
-		assert.NotZero(t, staleEpoch)
-		baselineServerSeq := afterFirstCompact.ServerSeq
-		assert.NotZero(t, baselineServerSeq,
-			"a doc with root content compacts to a snapshot change at server_seq 1")
+		assert.Equal(t, int64(0), compacted.Epoch, "snapshot compaction no longer bumps the epoch")
+		assert.Equal(t, docInfo.ServerSeq, compacted.ServerSeq, "server seq is not reset")
+		assert.Equal(t, docInfo.ServerSeq, compacted.SnapshotServerSeq,
+			"the snapshot floor is published at the pinned seq")
+		pinned := compacted.ServerSeq
 
-		// 02. The doc is force-compacted AGAIN while the client is offline; this
-		// bumps the epoch past what the client persisted, but leaves server_seq at
-		// the compacted snapshot so the resume serverSeq is not clamped away.
-		assert.NoError(t, packs.Compact(ctx, testBackend, project.ID, afterFirstCompact, true))
-
-		compactedInfo, err := documents.FindDocInfoByRefKey(ctx, testBackend, docRefKey)
+		// 02. A second compaction with no change beyond the floor is a no-op.
+		assert.NoError(t, packs.Compact(ctx, testBackend, project.ID, compacted, true))
+		again, err := documents.FindDocInfoByRefKey(ctx, testBackend, refKey)
 		assert.NoError(t, err)
-		assert.NotEqual(t, staleEpoch, compactedInfo.Epoch,
-			"force compaction must bump the doc epoch past the client's persisted epoch")
-		assert.Equal(t, baselineServerSeq, compactedInfo.ServerSeq,
-			"compaction of a one-change doc keeps server_seq at the snapshot")
+		assert.Equal(t, pinned, again.ServerSeq)
+		assert.Equal(t, pinned, again.SnapshotServerSeq)
 
-		// 03. Resume presenting the STALE (pre-compaction) epoch with the baseline
-		// serverSeq as the resume signal. It equals the doc's current server_seq,
-		// so no clamp defeats the signal; AttachDocument seeds the stale epoch
-		// (Case B), and the epoch check in pushpull fires ErrEpochMismatch — the
-		// re-anchor signal. The client then re-attaches for a snapshot via the
-		// existing machinery (same recovery path as the compaction integration test).
+		// 03. The offline client resumes at its old checkpoint and epoch with
+		// no re-anchor required.
 		resumeResp, err := testClient.ActivateClient(
 			ctx,
 			connect.NewRequest(&api.ActivateClientRequest{ClientKey: helper.TestKey(t).String() + "-resume"}),
 		)
 		assert.NoError(t, err)
-
 		_, err = testClient.AttachDocument(
 			ctx,
 			connect.NewRequest(&api.AttachDocumentRequest{
 				ClientId: resumeResp.Msg.ClientId,
 				ChangePack: &api.ChangePack{
 					DocumentKey: docKey.String(),
-					Checkpoint:  &api.Checkpoint{ServerSeq: baselineServerSeq, ClientSeq: 1},
-					Epoch:       staleEpoch,
+					Checkpoint:  &api.Checkpoint{ServerSeq: pinned, ClientSeq: 1},
+					Epoch:       0,
 				},
 			}),
 		)
-		assert.Error(t, err)
-		assert.Equal(t, connect.CodeFailedPrecondition, connect.CodeOf(err))
-		assert.Equal(t, "ErrEpochMismatch", converter.ErrorCodeOf(err))
+		assert.NoError(t, err)
 	})
 
-	t.Run("resume after compaction to empty root re-anchors via epoch", func(t *testing.T) {
+	t.Run("compacting a presence-only document is a no-op test", func(t *testing.T) {
 		ctx := context.Background()
 
 		projectInfo, err := testBackend.DB.FindProjectInfoByID(ctx, database.DefaultProjectID)
@@ -1072,12 +1055,6 @@ func TestPacks(t *testing.T) {
 
 		docKey := helper.TestKey(t)
 
-		// 01. Create a doc that carries ONLY a presence change (no root content).
-		// Such a doc compacts to an EMPTY root, so its server_seq falls back to 0
-		// (CompactChangeInfos: len(changes)==0 -> newServerSeq 0), unlike the
-		// root-content case which keeps server_seq at 1. Force-compact once so the
-		// epoch becomes non-zero (1): the presented-epoch seeding treats 0 as "no
-		// epoch presented", so a non-zero epoch is required to exercise the signal.
 		sdkClient, err := client.Dial(testRPCAddr)
 		assert.NoError(t, err)
 		assert.NoError(t, sdkClient.Activate(ctx))
@@ -1088,67 +1065,27 @@ func TestPacks(t *testing.T) {
 
 		doc := document.New(docKey)
 		assert.NoError(t, sdkClient.Attach(ctx, doc))
-		assert.NoError(t, doc.Update(func(r *json.Object, p *presence.Presence) error {
+		assert.NoError(t, doc.Update(func(_ *json.Object, p *presence.Presence) error {
 			p.Set("cursor", "0")
 			return nil
 		}))
 		assert.NoError(t, sdkClient.Sync(ctx))
 		assert.NoError(t, sdkClient.Detach(ctx, doc))
 
-		seedDocInfo, err := documents.FindDocInfoByKey(ctx, testBackend, project, docKey)
+		docInfo, err := documents.FindDocInfoByKey(ctx, testBackend, project, docKey)
 		assert.NoError(t, err)
-		docRefKey := seedDocInfo.RefKey()
-		assert.NoError(t, packs.Compact(ctx, testBackend, project.ID, seedDocInfo, true))
-
-		afterFirstCompact, err := documents.FindDocInfoByRefKey(ctx, testBackend, docRefKey)
+		// No stored operation change exists for a presence-only document:
+		// nothing can be pruned, so compaction must not publish a floor.
+		assert.NoError(t, packs.Compact(ctx, testBackend, project.ID, docInfo, true))
+		reloaded, err := documents.FindDocInfoByRefKey(ctx, testBackend, docInfo.RefKey())
 		assert.NoError(t, err)
-		staleEpoch := afterFirstCompact.Epoch
-		assert.NotZero(t, staleEpoch)
-		// The empty-root compaction drives server_seq to 0.
-		assert.Equal(t, int64(0), afterFirstCompact.ServerSeq,
-			"a presence-only doc compacts to an empty root at server_seq 0")
-
-		// 02. Force-compact AGAIN while the client is offline; the epoch advances
-		// past the client's persisted epoch, server_seq stays at 0.
-		assert.NoError(t, packs.Compact(ctx, testBackend, project.ID, afterFirstCompact, true))
-
-		compactedInfo, err := documents.FindDocInfoByRefKey(ctx, testBackend, docRefKey)
+		assert.Equal(t, int64(0), reloaded.SnapshotServerSeq)
+		active, err := testBackend.DB.FindActiveCompactionInfo(ctx, docInfo.RefKey())
 		assert.NoError(t, err)
-		assert.NotEqual(t, staleEpoch, compactedInfo.Epoch,
-			"force compaction must bump the doc epoch past the client's persisted epoch")
-		assert.Equal(t, int64(0), compactedInfo.ServerSeq)
-
-		// 03. Resume presenting the STALE epoch. The client persisted server_seq 1
-		// (its pre-compaction baseline), but the doc now sits at server_seq 0, so
-		// the over-claim clamp in AttachDocument drives presented.ServerSeq to 0.
-		// Even so, the presented epoch is an INDEPENDENT resume signal: seeding the
-		// stale epoch makes the epoch check fire ErrEpochMismatch, matching the
-		// design's "stale epoch -> ErrEpochMismatch" recovery tier. Before the fix,
-		// the ServerSeq==0 gate routed into the fresh branch (current epoch) and
-		// recovery came via ErrInvalidClientSeq instead.
-		resumeResp, err := testClient.ActivateClient(
-			ctx,
-			connect.NewRequest(&api.ActivateClientRequest{ClientKey: helper.TestKey(t).String() + "-resume"}),
-		)
-		assert.NoError(t, err)
-
-		_, err = testClient.AttachDocument(
-			ctx,
-			connect.NewRequest(&api.AttachDocumentRequest{
-				ClientId: resumeResp.Msg.ClientId,
-				ChangePack: &api.ChangePack{
-					DocumentKey: docKey.String(),
-					Checkpoint:  &api.Checkpoint{ServerSeq: 1, ClientSeq: 1},
-					Epoch:       staleEpoch,
-				},
-			}),
-		)
-		assert.Error(t, err)
-		assert.Equal(t, connect.CodeFailedPrecondition, connect.CodeOf(err))
-		assert.Equal(t, "ErrEpochMismatch", converter.ErrorCodeOf(err))
+		assert.Nil(t, active)
 	})
 
-	t.Run("stale-epoch resume recovers via clean re-attach and re-push", func(t *testing.T) {
+	t.Run("attached client keeps syncing through compaction and a new client gets a snapshot test", func(t *testing.T) {
 		ctx := context.Background()
 
 		projectInfo, err := testBackend.DB.FindProjectInfoByID(ctx, database.DefaultProjectID)
@@ -1157,9 +1094,7 @@ func TestPacks(t *testing.T) {
 
 		docKey := helper.TestKey(t)
 
-		// 01. Seed a doc with root content and force-compact twice so the working
-		// epoch is non-zero (compaction of a one-change doc keeps server_seq at 1),
-		// mirroring the stale-epoch re-anchor setup.
+		// 01. An attached client edits and syncs.
 		sdkClient, err := client.Dial(testRPCAddr)
 		assert.NoError(t, err)
 		assert.NoError(t, sdkClient.Activate(ctx))
@@ -1169,99 +1104,45 @@ func TestPacks(t *testing.T) {
 		}()
 
 		doc := document.New(docKey)
-		assert.NoError(t, sdkClient.Attach(ctx, doc))
-		assert.NoError(t, doc.Update(func(r *json.Object, p *presence.Presence) error {
-			r.SetString("k", "v")
+		assert.NoError(t, sdkClient.Attach(ctx, doc, client.WithInitialRoot(
+			yson.ParseObject(`{"text": Text()}`),
+		)))
+		assert.NoError(t, doc.Update(func(r *json.Object, _ *presence.Presence) error {
+			r.GetText("text").Edit(0, 0, "v")
 			return nil
 		}))
 		assert.NoError(t, sdkClient.Sync(ctx))
+
+		// 02. Force compaction while the client stays attached: no epoch
+		// mismatch, no re-attach.
+		docInfo, err := documents.FindDocInfoByKey(ctx, testBackend, project, docKey)
+		assert.NoError(t, err)
+		assert.NoError(t, packs.Compact(ctx, testBackend, project.ID, docInfo, true))
+
+		// 03. The same client keeps pushing and pulling with monotonic seqs.
+		assert.NoError(t, doc.Update(func(r *json.Object, _ *presence.Presence) error {
+			r.GetText("text").Edit(1, 1, "2")
+			return nil
+		}))
+		assert.NoError(t, sdkClient.Sync(ctx))
+		assert.Equal(t, "v2", doc.Root().GetText("text").String())
+
+		// 04. A brand-new client below the floor receives the published
+		// snapshot (the change it would need was pruned) and converges to the
+		// current content.
+		fresh, err := client.Dial(testRPCAddr)
+		assert.NoError(t, err)
+		assert.NoError(t, fresh.Activate(ctx))
+		defer func() {
+			assert.NoError(t, fresh.Deactivate(ctx))
+			assert.NoError(t, fresh.Close())
+		}()
+		freshDoc := document.New(docKey)
+		assert.NoError(t, fresh.Attach(ctx, freshDoc))
+		assert.NoError(t, fresh.Sync(ctx))
+		assert.Equal(t, "v2", freshDoc.Root().GetText("text").String())
+		assert.NoError(t, fresh.Detach(ctx, freshDoc))
 		assert.NoError(t, sdkClient.Detach(ctx, doc))
-
-		seedDocInfo, err := documents.FindDocInfoByKey(ctx, testBackend, project, docKey)
-		assert.NoError(t, err)
-		docRefKey := seedDocInfo.RefKey()
-		assert.NoError(t, packs.Compact(ctx, testBackend, project.ID, seedDocInfo, true))
-
-		afterFirstCompact, err := documents.FindDocInfoByRefKey(ctx, testBackend, docRefKey)
-		assert.NoError(t, err)
-		staleEpoch := afterFirstCompact.Epoch
-		assert.NotZero(t, staleEpoch)
-		baselineServerSeq := afterFirstCompact.ServerSeq
-		assert.NoError(t, packs.Compact(ctx, testBackend, project.ID, afterFirstCompact, true))
-
-		compactedInfo, err := documents.FindDocInfoByRefKey(ctx, testBackend, docRefKey)
-		assert.NoError(t, err)
-		currentEpoch := compactedInfo.Epoch
-		assert.NotEqual(t, staleEpoch, currentEpoch)
-
-		// 02. A stale resume is rejected with ErrEpochMismatch (the re-anchor
-		// signal). clients.AttachDocument commits the attach row before PushPull
-		// runs the epoch check, so the rejected session is left attached at the
-		// stale baseline — exactly the "attached but sync fails" state a live
-		// client sees after an offline compaction.
-		rejectResp, err := testClient.ActivateClient(
-			ctx,
-			connect.NewRequest(&api.ActivateClientRequest{ClientKey: helper.TestKey(t).String() + "-reject"}),
-		)
-		assert.NoError(t, err)
-		_, err = testClient.AttachDocument(
-			ctx,
-			connect.NewRequest(&api.AttachDocumentRequest{
-				ClientId: rejectResp.Msg.ClientId,
-				ChangePack: &api.ChangePack{
-					DocumentKey: docKey.String(),
-					Checkpoint:  &api.Checkpoint{ServerSeq: baselineServerSeq, ClientSeq: 1},
-					Epoch:       staleEpoch,
-				},
-			}),
-		)
-		assert.Equal(t, "ErrEpochMismatch", converter.ErrorCodeOf(err))
-
-		// 03. Recovery: the client re-anchors by attaching CLEAN — a fresh session
-		// (a reload re-activates), checkpoint reset to 0, and no stale epoch. The
-		// resume then seeds the current doc epoch, so the epoch check no longer
-		// fires; the re-anchor delivers the compacted state and a pending change
-		// stamped as a fresh local edit pushes on the new epoch. This closes the
-		// arc the stale-epoch tests stop short of: rejection -> re-anchor -> push.
-		recoverResp, err := testClient.ActivateClient(
-			ctx,
-			connect.NewRequest(&api.ActivateClientRequest{ClientKey: helper.TestKey(t).String() + "-recover"}),
-		)
-		assert.NoError(t, err)
-		stableActor, err := hex.DecodeString(recoverResp.Msg.ActorId)
-		assert.NoError(t, err)
-
-		recoverPack, err := testClient.AttachDocument(
-			ctx,
-			connect.NewRequest(&api.AttachDocumentRequest{
-				ClientId: recoverResp.Msg.ClientId,
-				ChangePack: &api.ChangePack{
-					DocumentKey: docKey.String(),
-					Checkpoint:  &api.Checkpoint{ServerSeq: 0, ClientSeq: 1},
-					Changes: []*api.Change{{
-						Id: &api.ChangeID{ClientSeq: 1, Lamport: 1, ActorId: stableActor},
-						PresenceChange: &api.PresenceChange{
-							Type: api.PresenceChange_CHANGE_TYPE_PUT,
-							Presence: &api.Presence{
-								Data: map[string]string{"recovered": "true"},
-							},
-						},
-					}},
-				},
-			}),
-		)
-		assert.NoError(t, err, "clean re-attach after a stale-epoch rejection must re-anchor, not fail")
-		// The recovered client is anchored on the doc's CURRENT epoch, not the
-		// stale one it was rejected for.
-		assert.Equal(t, currentEpoch, recoverPack.Msg.ChangePack.Epoch)
-
-		// 04. The re-pushed change advanced server_seq past the compacted baseline,
-		// proving the client makes progress again after re-anchoring rather than
-		// staying permanently rejected.
-		recoveredInfo, err := documents.FindDocInfoByRefKey(ctx, testBackend, docRefKey)
-		assert.NoError(t, err)
-		assert.Greater(t, recoveredInfo.ServerSeq, baselineServerSeq,
-			"the recovered client's change must advance server_seq on the new epoch")
 	})
 }
 

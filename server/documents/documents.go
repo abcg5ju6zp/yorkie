@@ -112,7 +112,7 @@ func CreateDocument(
 		return nil, err
 	}
 
-	// This path writes the initial root straight through CompactChangeInfos, so
+	// This path writes the initial root straight through CreateChangeInfos, so
 	// it never meets the push gate in pushPack. Measure the root the caller
 	// supplied against the project quota here instead.
 	if err = packs.CheckLiveSize(
@@ -123,11 +123,24 @@ func CreateDocument(
 		return nil, err
 	}
 
-	if err = be.DB.CompactChangeInfos(
+	// Store the initial root as the document's first change through the
+	// regular change path, so its server sequence follows the same monotonic
+	// numbering as every PushPull.
+	pack := newDoc.CreateChangePack()
+	changeInfos := make([]*database.ChangeInfo, 0, len(pack.Changes))
+	for _, cn := range pack.Changes {
+		info, err := database.NewFromChange(docInfo.RefKey(), cn)
+		if err != nil {
+			return nil, err
+		}
+		changeInfos = append(changeInfos, info)
+	}
+	if _, _, err = be.DB.CreateChangeInfos(
 		ctx,
-		docInfo,
-		docInfo.ServerSeq,
-		newDoc.CreateChangePack().Changes,
+		docInfo.RefKey(),
+		change.InitialCheckpoint,
+		changeInfos,
+		false,
 	); err != nil {
 		return nil, err
 	}

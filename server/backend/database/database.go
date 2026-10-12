@@ -58,9 +58,15 @@ var (
 	ErrConflictOnUpdate = errors.FailedPrecond("conflict on update").WithCode("ErrConflictOnUpdate")
 
 	// ErrChangeTooLarge is returned when a change does not fit in a single
-	// database record, such as the change compaction would collapse a large
-	// document into.
+	// database record, such as the candidate snapshot a compaction of a
+	// large document would store.
 	ErrChangeTooLarge = errors.ResourceExhausted("change too large").WithCode("ErrChangeTooLarge")
+
+	// ErrCompactionInProgress is returned when a compaction generation is
+	// already active for the document. At most one generation can run per
+	// document; callers resume the active one instead of starting another.
+	ErrCompactionInProgress = errors.FailedPrecond("compaction already in progress").
+				WithCode("ErrCompactionInProgress")
 
 	// ErrVersionVectorNotFound is returned when the version vector could not be found.
 	ErrVersionVectorNotFound = errors.NotFound("version vector not found").WithCode("ErrVersionVectorNotFound")
@@ -350,13 +356,77 @@ type Database interface {
 		isRemoved bool,
 	) (*DocInfo, change.Checkpoint, error)
 
-	// CompactChangeInfos stores the given compacted changes then updates the docInfo.
-	CompactChangeInfos(
+	// CreateCompactionInfo claims a new compaction generation for a document.
+	// It fails with ErrCompactionInProgress when another generation is still
+	// active for the same document. The pinned ServerSeq, Lamport and
+	// VersionVector never change for the life of the returned generation.
+	CreateCompactionInfo(ctx context.Context, info *CompactionInfo) error
+
+	// FindActiveCompactionInfo returns the currently active compaction
+	// generation for the given document, or nil when none is active.
+	FindActiveCompactionInfo(
 		ctx context.Context,
-		docInfo *DocInfo,
-		lastServerSeq int64,
-		changes []*change.Change,
+		docRefKey types.DocRefKey,
+	) (*CompactionInfo, error)
+
+	// FindRecoverableCompactionInfos returns active compaction generations
+	// whose ID is greater than afterID, ordered by ID ascending and capped at
+	// limit. A zero afterID starts from the first generation.
+	FindRecoverableCompactionInfos(
+		ctx context.Context,
+		limit int,
+		afterID types.ID,
+	) ([]*CompactionInfo, error)
+
+	// SaveCompactionSnapshot builds and stores the candidate snapshot of the
+	// given generation without publishing it: readers of published snapshots
+	// never observe it. It is idempotent and safe to retry. ErrChangeTooLarge
+	// is returned before anything is written when the snapshot does not fit a
+	// database record.
+	SaveCompactionSnapshot(
+		ctx context.Context,
+		info *CompactionInfo,
+		doc *document.InternalDocument,
 	) error
+
+	// HasCompactionSnapshot reports whether the candidate snapshot of the
+	// given generation has already been stored, including its external body.
+	HasCompactionSnapshot(ctx context.Context, info *CompactionInfo) (bool, error)
+
+	// PublishCompactionSnapshot atomically publishes the candidate snapshot
+	// as the document's new readable snapshot at the pinned server sequence,
+	// and advances the document's snapshot floor to it. Every write is
+	// idempotent, so retrying after an uncertain response is safe.
+	PublishCompactionSnapshot(ctx context.Context, info *CompactionInfo) error
+
+	// PruneCompactionChanges removes only the changes that the published
+	// snapshot covers (server sequence at or below the pinned point) and the
+	// older snapshots. Changes appended after the claim (above the pinned
+	// point) are never touched. It is idempotent and returns the number of
+	// change records that were removed.
+	PruneCompactionChanges(ctx context.Context, info *CompactionInfo) (int64, error)
+
+	// DeleteCompactionInfo ends the generation by deleting its record and
+	// candidate snapshot. It is idempotent.
+	DeleteCompactionInfo(ctx context.Context, info *CompactionInfo) error
+
+	// FindLatestChangeInfo returns the latest stored change at or below the
+	// given server sequence, or nil when the document has no stored change.
+	FindLatestChangeInfo(
+		ctx context.Context,
+		docRefKey types.DocRefKey,
+		serverSeq int64,
+	) (*ChangeInfo, error)
+
+	// FindClosestCompactedSnapshotInfo returns the metadata of the latest
+	// compaction-published snapshot at or below the given server sequence,
+	// which is the history floor. It returns an empty SnapshotInfo when the
+	// document has never been compacted.
+	FindClosestCompactedSnapshotInfo(
+		ctx context.Context,
+		docRefKey types.DocRefKey,
+		serverSeq int64,
+	) (*SnapshotInfo, error)
 
 	// FindLatestChangeInfoByActor returns the latest change created by given actorID.
 	FindLatestChangeInfoByActor(

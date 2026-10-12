@@ -20,7 +20,6 @@ package mongo
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	gotime "time"
@@ -55,12 +54,6 @@ const (
 	// objectIDElementSize is the size of the `_id` element MongoDB adds to a
 	// record written without one: type byte, "_id\x00" and a 12-byte ObjectID.
 	objectIDElementSize = 1 + 4 + 12
-
-	// compactionUndoTimeout bounds the reads and writes that settle a failed
-	// compaction. They run on a context detached from the one the failed write
-	// used, since a cancelled or expired context is the likeliest reason for
-	// that failure and would make the work that repairs it a no-op.
-	compactionUndoTimeout = 5 * gotime.Second
 )
 
 // Client is a client that connects to Mongo DB and reads or saves Yorkie data.
@@ -1497,8 +1490,21 @@ func (c *Client) FindCompactionCandidates(
 ) ([]*database.DocInfo, int64, types.ID, error) {
 	// Use (server_seq, _id) for cursor-based pagination to leverage the compound index.
 	// Query: (server_seq > lastServerSeq) OR (server_seq = lastServerSeq AND _id > lastDocID)
+	//
+	// Compaction no longer resets server_seq; it publishes a snapshot at the
+	// current sequence (snapshot_server_seq) and prunes everything it covers.
+	// A document is therefore only a candidate when the history beyond its
+	// snapshot floor still reaches the minimum change count.
 	filter := bson.M{
-		"server_seq": bson.M{"$gte": compactionMinChanges},
+		"$expr": bson.M{
+			"$gte": bson.A{
+				bson.M{"$subtract": bson.A{
+					"$server_seq",
+					bson.M{"$ifNull": bson.A{"$snapshot_server_seq", int64(0)}},
+				}},
+				int64(compactionMinChanges),
+			},
+		},
 		"$or": []bson.M{
 			{"server_seq": bson.M{"$gt": lastServerSeq}},
 			{
@@ -2072,270 +2078,465 @@ func (c *Client) CreateChangeInfos(
 	return docInfo, checkpoint, nil
 }
 
-func (c *Client) CompactChangeInfos(
+// CreateCompactionInfo claims a new compaction generation for a document.
+func (c *Client) CreateCompactionInfo(
 	ctx context.Context,
-	docInfo *database.DocInfo,
-	lastServerSeq int64,
-	changes []*change.Change,
+	info *database.CompactionInfo,
 ) error {
-	newServerSeq := int64(1)
-	if len(changes) == 0 {
-		newServerSeq = 0
-	} else if len(changes) != 1 {
-		return fmt.Errorf("compact document of %s: invalid change size %d", docInfo.RefKey(), len(changes))
-	}
+	now := gotime.Now()
+	info.CreatedAt = now
+	info.UpdatedAt = now
+	info.Status = database.CompactionStatusCandidate
 
-	// 1. Encode the compacted change before touching anything. Compaction
-	// folds the whole document into one change record, so a large document
-	// can produce a record MongoDB refuses to store, and that has to be found
-	// while the document is still intact.
-	var compacted bson.Raw
-	if len(changes) == 1 {
-		cn := changes[0]
-		encodedOperations, err := database.EncodeOperations(cn.Operations())
-		if err != nil {
-			return err
-		}
-
-		// No _id: the record replaces the one at newServerSeq in place, which
-		// keeps that record's _id, or is upserted with a fresh one.
-		compacted, err = c.marshal(bson.D{
-			{Key: "project_id", Value: docInfo.ProjectID},
-			{Key: "doc_id", Value: docInfo.ID},
-			{Key: "server_seq", Value: newServerSeq},
-			{Key: "client_seq", Value: cn.ClientSeq()},
-			{Key: "lamport", Value: cn.ID().Lamport()},
-			{Key: "actor_id", Value: types.ID(cn.ID().ActorID().String())},
-			{Key: "version_vector", Value: cn.ID().VersionVector()},
-			{Key: "message", Value: cn.Message()},
-			{Key: "operations", Value: encodedOperations},
-			{Key: "presence_change", Value: cn.PresenceChange()},
-		})
-		if err != nil {
-			return fmt.Errorf("compact document of %s: %w", docInfo.RefKey(), err)
-		}
-		if size := len(compacted) + objectIDElementSize; size > maxDocumentSize {
+	if _, err := c.collection(ColCompactions).InsertOne(ctx, bson.M{
+		"_id":               info.ID,
+		"project_id":        info.ProjectID,
+		"doc_id":            info.DocID,
+		"server_seq":        info.ServerSeq,
+		"lamport":           info.Lamport,
+		"version_vector":    info.VersionVector,
+		"status":            string(database.CompactionStatusCandidate),
+		"has_external_body": false,
+		"live_size":         int64(0),
+		"created_at":        now,
+		"updated_at":        now,
+	}); err != nil {
+		if mongo.IsDuplicateKeyError(err) {
 			return fmt.Errorf(
-				"compact document of %s: %d bytes: %w",
-				docInfo.RefKey(), size, database.ErrChangeTooLarge,
+				"claim compaction of %s: %w", info.RefKey(), database.ErrCompactionInProgress,
 			)
 		}
-	}
-
-	// 2. Claim the document before writing to its changes. MongoDB is not
-	// guaranteed to run as a replica set here, so the steps below cannot share
-	// a transaction; this update is the commit point instead. It succeeds only
-	// if no push has landed since lastServerSeq, and once it has, a push that
-	// read the old server_seq fails its own conditional update and a client
-	// on the old epoch has its changes discarded (pushPack). A refused claim
-	// has touched nothing.
-	refKey := docInfo.RefKey()
-	c.docCache.Remove(refKey)
-	res, err := c.collection(ColDocuments).UpdateOne(ctx, bson.M{
-		"project_id": docInfo.ProjectID,
-		"_id":        docInfo.ID,
-		"server_seq": lastServerSeq,
-	}, bson.M{
-		"$set": bson.M{
-			"server_seq":   newServerSeq,
-			"compacted_at": gotime.Now(),
-		},
-		"$inc": bson.M{
-			"epoch": int64(1),
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("compact document of %s: %w", refKey, err)
-	}
-	if res.MatchedCount == 0 {
-		return c.compactionClaimError(ctx, refKey)
-	}
-
-	// 3. Store the compacted change over the record at newServerSeq in one
-	// write, so the document reads as the compacted change the moment this
-	// returns rather than after a delete and an insert.
-	//
-	// Failing here would otherwise leave the claim standing over the
-	// pre-compaction record at newServerSeq: the document would silently read
-	// as its own first historical change, and with server_seq already at
-	// newServerSeq no later compaction could reach it. The steps cannot share
-	// a transaction, so settle the claim instead before reporting the error.
-	c.changeCache.Remove(refKey)
-	if compacted != nil {
-		if _, err := c.collection(ColChanges).ReplaceOne(ctx, bson.M{
-			"project_id": docInfo.ProjectID,
-			"doc_id":     docInfo.ID,
-			"server_seq": newServerSeq,
-		}, compacted, options.Replace().SetUpsert(true)); err != nil {
-			landed, settled := c.settleCompactionClaim(
-				ctx, docInfo, lastServerSeq, newServerSeq, compacted,
-				fmt.Errorf("compact document of %s: %w", refKey, err),
-			)
-			if !landed {
-				return settled
-			}
-
-			// The compacted change is stored despite the error, so the claim
-			// stands and the purge below is still due. Run it off a context
-			// the failure may already have cancelled.
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), compactionUndoTimeout)
-			defer cancel()
-		}
-	}
-
-	// 4. Drop what the compacted change replaces: the changes past it, the
-	// snapshots and the version vectors.
-	if _, err := c.purgeDocumentInternals(ctx, docInfo.ProjectID, docInfo.ID, newServerSeq); err != nil {
-		return err
+		return fmt.Errorf("claim compaction of %s: %w", info.RefKey(), err)
 	}
 
 	return nil
 }
 
-// settleCompactionClaim decides what to do with the claim CompactChangeInfos
-// took in step 2 once the write of the compacted change reported an error, and
-// reports whether that change is in fact stored at claimedServerSeq.
-//
-// A MongoDB write error is not proof the write did not apply: a write-concern
-// timeout, a retried command or an error surfaced after the primary accepted
-// the operation all error on a write that is there. Rolling server_seq back
-// over an applied compacted record would leave the whole-root change at
-// claimedServerSeq with the changes it replaces still in place, so every reader
-// that rebuilds the root from the change history would replay the document on
-// top of itself. The ambiguity is therefore settled by reading the record back
-// before anything is undone, and the claim is only rolled back when the stored
-// record is demonstrably not the compacted one.
-//
-// When the write did land, (true, nil) is returned and the caller carries on
-// with the purge the compacted change makes due. When the read itself fails
-// nothing is undone — an unverified rollback is the one outcome that corrupts
-// the history — and the cause is returned with the failure to verify joined to
-// it, since the document is then left mid-compaction and needs an operator.
-func (c *Client) settleCompactionClaim(
+// FindActiveCompactionInfo returns the active compaction generation of a
+// document.
+func (c *Client) FindActiveCompactionInfo(
 	ctx context.Context,
-	docInfo *database.DocInfo,
-	lastServerSeq, claimedServerSeq int64,
-	compacted bson.Raw,
-	cause error,
-) (bool, error) {
-	refKey := docInfo.RefKey()
-
-	// The failed write most likely failed because its context was cancelled or
-	// expired, which would make every repair below a no-op on that same
-	// context. Detach from it and bound the repair on its own.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), compactionUndoTimeout)
-	defer cancel()
-
-	stored, err := c.collection(ColChanges).FindOne(ctx, bson.M{
-		"project_id": docInfo.ProjectID,
-		"doc_id":     docInfo.ID,
-		"server_seq": claimedServerSeq,
-	}).Raw()
-	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
-		return false, errors.Join(cause, fmt.Errorf(
-			"verify compacted change of %s: %w", refKey, err,
-		))
-	}
-	if err == nil && rawEqualIgnoringID(stored, compacted) {
-		return true, nil
+	docRefKey types.DocRefKey,
+) (*database.CompactionInfo, error) {
+	result := c.collection(ColCompactions).FindOne(ctx, bson.M{
+		"project_id": docRefKey.ProjectID,
+		"doc_id":     docRefKey.DocID,
+	})
+	if err := result.Err(); err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("find active compaction of %s: %w", docRefKey, err)
 	}
 
-	return false, c.undoCompactionClaim(ctx, docInfo, lastServerSeq, claimedServerSeq, cause)
+	info := &database.CompactionInfo{}
+	if err := result.Decode(info); err != nil {
+		return nil, fmt.Errorf("decode active compaction of %s: %w", docRefKey, err)
+	}
+	return info, nil
 }
 
-// undoCompactionClaim restores the document row CompactChangeInfos claimed in
-// step 2 after the write that follows it failed without landing, and returns
-// the cause.
-//
-// The restore is conditional on the claim still standing untouched, so it
-// cannot clobber a document something else has moved on; in that case, and if
-// the restore itself fails, the cause is returned with the failure to undo
-// joined to it, since the document is then left mid-compaction and needs an
-// operator. The epoch is left incremented either way: clients that already saw
-// it must re-attach, which is harmless, while lowering it back could hand two
-// different document states the same epoch.
-func (c *Client) undoCompactionClaim(
+// FindRecoverableCompactionInfos returns active compaction generations after
+// the given generation ID.
+func (c *Client) FindRecoverableCompactionInfos(
 	ctx context.Context,
-	docInfo *database.DocInfo,
-	lastServerSeq, claimedServerSeq int64,
-	cause error,
-) error {
-	refKey := docInfo.RefKey()
-	c.docCache.Remove(refKey)
+	limit int,
+	afterID types.ID,
+) ([]*database.CompactionInfo, error) {
+	filter := bson.M{}
+	if afterID != database.ZeroID {
+		filter["_id"] = bson.M{"$gt": afterID}
+	}
 
-	res, err := c.collection(ColDocuments).UpdateOne(ctx, bson.M{
-		"project_id": docInfo.ProjectID,
-		"_id":        docInfo.ID,
-		"server_seq": claimedServerSeq,
-	}, bson.M{
-		"$set": bson.M{
-			"server_seq":   lastServerSeq,
-			"compacted_at": docInfo.CompactedAt,
-		},
-	})
+	cursor, err := c.collection(ColCompactions).Find(ctx, filter,
+		options.Find().
+			SetSort(bson.D{{Key: "_id", Value: 1}}).
+			SetLimit(int64(limit)).
+			SetProjection(bson.M{"snapshot": 0}))
 	if err != nil {
-		return errors.Join(cause, fmt.Errorf("undo compaction claim of %s: %w", refKey, err))
+		return nil, fmt.Errorf("find recoverable compactions: %w", err)
+	}
+
+	var infos []*database.CompactionInfo
+	if err := cursor.All(ctx, &infos); err != nil {
+		return nil, fmt.Errorf("fetch recoverable compactions: %w", err)
+	}
+	return infos, nil
+}
+
+// SaveCompactionSnapshot stores the rebuilt candidate snapshot of the
+// generation without making it visible to snapshot readers.
+func (c *Client) SaveCompactionSnapshot(
+	ctx context.Context,
+	info *database.CompactionInfo,
+	doc *document.InternalDocument,
+) error {
+	snapshot, err := converter.SnapshotToBytes(doc.RootObject(), doc.AllPresences())
+	if err != nil {
+		return err
+	}
+
+	compressed, err := database.CompressSnapshot(snapshot)
+	if err != nil {
+		return fmt.Errorf("compress compaction snapshot of %s: %w", info.RefKey(), err)
+	}
+
+	// Find an over-large candidate while the document is still intact, before
+	// either the body or the generation row are touched.
+	if len(compressed)+objectIDElementSize > maxDocumentSize {
+		return fmt.Errorf(
+			"compact document of %s: %d bytes: %w",
+			info.RefKey(), len(compressed)+objectIDElementSize, database.ErrChangeTooLarge,
+		)
+	}
+
+	hasExternalBody := len(compressed) > database.SnapshotBodyThreshold
+	docSize := doc.DocSize().Live
+	liveSize := int64(docSize.Total())
+	now := gotime.Now()
+
+	if hasExternalBody {
+		if _, err := c.collection(ColCompactionBodies).UpdateOne(ctx, bson.M{
+			"project_id": info.ProjectID,
+			"doc_id":     info.DocID,
+			"server_seq": info.ServerSeq,
+		}, bson.M{
+			"$set": bson.M{
+				"snapshot":   compressed,
+				"created_at": now,
+			},
+			"$setOnInsert": bson.M{
+				"_id":        bson.NewObjectID(),
+				"project_id": info.ProjectID,
+				"doc_id":     info.DocID,
+				"server_seq": info.ServerSeq,
+			},
+		}, options.UpdateOne().SetUpsert(true)); err != nil {
+			return fmt.Errorf("store compaction snapshot body of %s: %w", info.RefKey(), err)
+		}
+	}
+
+	setFields := bson.M{
+		"has_external_body": hasExternalBody,
+		"live_size":         liveSize,
+		"updated_at":        now,
+	}
+	if hasExternalBody {
+		setFields["snapshot"] = nil
+	} else {
+		setFields["snapshot"] = compressed
+	}
+
+	res, err := c.collection(ColCompactions).UpdateOne(ctx, bson.M{
+		"_id": info.ID,
+	}, bson.M{"$set": setFields})
+	if err != nil {
+		return fmt.Errorf("store compaction snapshot of %s: %w", info.RefKey(), err)
 	}
 	if res.MatchedCount == 0 {
-		return errors.Join(cause, fmt.Errorf(
-			"undo compaction claim of %s: %w", refKey, database.ErrConflictOnUpdate,
-		))
+		return fmt.Errorf("store compaction snapshot of %s: %w", info.RefKey(), database.ErrDocumentNotFound)
 	}
 
-	return cause
+	info.Snapshot = compressed
+	info.HasExternalBody = hasExternalBody
+	info.LiveSize = liveSize
+	info.UpdatedAt = now
+	return nil
 }
 
-// rawEqualIgnoringID reports whether stored holds exactly the elements of want,
-// in order, apart from the `_id` MongoDB keeps across a replace. Both sides
-// come from the same marshalling of the same fields in the same order, so an
-// applied replace is byte-identical and anything else — the pre-compaction
-// record, a partial write — is not.
-func rawEqualIgnoringID(stored, want bson.Raw) bool {
-	storedElements, err := stored.Elements()
-	if err != nil {
-		return false
-	}
-	wantElements, err := want.Elements()
-	if err != nil {
-		return false
-	}
-
-	idx := 0
-	for _, element := range storedElements {
-		if element.Key() == "_id" {
-			continue
+// HasCompactionSnapshot reports whether the candidate snapshot of the
+// generation has already been stored.
+func (c *Client) HasCompactionSnapshot(
+	ctx context.Context,
+	info *database.CompactionInfo,
+) (bool, error) {
+	if !info.HasExternalBody {
+		if len(info.Snapshot) > 0 {
+			return true, nil
 		}
-		if idx >= len(wantElements) {
-			return false
+		// The generation may have been listed without its snapshot bytes
+		// (the recovery query projects them out); read the row before
+		// concluding the candidate is missing.
+		stored, err := c.FindActiveCompactionInfo(ctx, info.RefKey())
+		if err != nil {
+			return false, err
 		}
-
-		got, expected := element.Value(), wantElements[idx].Value()
-		if element.Key() != wantElements[idx].Key() ||
-			got.Type != expected.Type ||
-			!bytes.Equal(got.Value, expected.Value) {
-			return false
-		}
-		idx++
+		return stored != nil && stored.ID == info.ID && len(stored.Snapshot) > 0, nil
 	}
 
-	return idx == len(wantElements)
+	err := c.collection(ColCompactionBodies).FindOne(ctx, bson.M{
+		"project_id": info.ProjectID,
+		"doc_id":     info.DocID,
+		"server_seq": info.ServerSeq,
+	}, options.FindOne().SetProjection(bson.M{"_id": 1})).Err()
+	if err == nil {
+		return true, nil
+	}
+	if err == mongo.ErrNoDocuments {
+		return false, nil
+	}
+	return false, fmt.Errorf("find compaction snapshot body of %s: %w", info.RefKey(), err)
 }
 
-// compactionClaimError tells a document that is gone from one that moved past
-// the server seq compaction read.
-func (c *Client) compactionClaimError(ctx context.Context, refKey types.DocRefKey) error {
-	err := c.collection(ColDocuments).FindOne(ctx, bson.M{
-		"project_id": refKey.ProjectID,
-		"_id":        refKey.DocID,
-	}).Err()
-	if errors.Is(err, mongo.ErrNoDocuments) {
-		return fmt.Errorf("compact document of %s: %w", refKey, database.ErrDocumentNotFound)
+// compactionSnapshotBytes reads the stored candidate snapshot of the
+// generation.
+func (c *Client) compactionSnapshotBytes(
+	ctx context.Context,
+	info *database.CompactionInfo,
+) ([]byte, error) {
+	if !info.HasExternalBody {
+		if len(info.Snapshot) > 0 {
+			return info.Snapshot, nil
+		}
+		stored, err := c.FindActiveCompactionInfo(ctx, info.RefKey())
+		if err != nil {
+			return nil, err
+		}
+		if stored == nil || stored.ID != info.ID || len(stored.Snapshot) == 0 {
+			return nil, fmt.Errorf(
+				"publish compaction snapshot of %s: %w", info.RefKey(), database.ErrSnapshotNotFound,
+			)
+		}
+		return stored.Snapshot, nil
 	}
+
+	result := c.collection(ColCompactionBodies).FindOne(ctx, bson.M{
+		"project_id": info.ProjectID,
+		"doc_id":     info.DocID,
+		"server_seq": info.ServerSeq,
+	})
+	body := &database.SnapshotBodyInfo{}
+	if err := result.Decode(body); err != nil {
+		return nil, fmt.Errorf("find compaction snapshot body of %s: %w", info.RefKey(), err)
+	}
+	return body.Snapshot, nil
+}
+
+// PublishCompactionSnapshot publishes the candidate snapshot at the pinned
+// server sequence and advances the document's snapshot floor to it.
+func (c *Client) PublishCompactionSnapshot(
+	ctx context.Context,
+	info *database.CompactionInfo,
+) error {
+	refKey := info.RefKey()
+	compressed, err := c.compactionSnapshotBytes(ctx, info)
 	if err != nil {
-		return fmt.Errorf("compact document of %s: %w", refKey, err)
+		return err
 	}
-	return fmt.Errorf("compact document of %s: %w", refKey, database.ErrConflictOnUpdate)
+	now := gotime.Now()
+
+	// With no opt-in client tracking this document the snapshot VV has no
+	// GC consumer; persist an empty VV like CreateSnapshotInfo does.
+	vv := info.VersionVector
+	hasOptIn, err := c.hasVersionVectorRow(ctx, refKey)
+	if err != nil {
+		return err
+	}
+	if !hasOptIn {
+		vv = time.NewVersionVector()
+	}
+
+	// 1. Publish the external body first so a metadata row never points at a
+	// missing body. Both writes are idempotent.
+	if info.HasExternalBody {
+		if _, err := c.collection(ColSnapshotBodies).UpdateOne(ctx, bson.M{
+			"project_id": info.ProjectID,
+			"doc_id":     info.DocID,
+			"server_seq": info.ServerSeq,
+		}, bson.M{
+			"$set": bson.M{
+				"snapshot":   compressed,
+				"created_at": now,
+			},
+			"$setOnInsert": bson.M{
+				"_id":        bson.NewObjectID(),
+				"project_id": info.ProjectID,
+				"doc_id":     info.DocID,
+				"server_seq": info.ServerSeq,
+			},
+		}, options.UpdateOne().SetUpsert(true)); err != nil {
+			return fmt.Errorf("publish snapshot body of %s: %w", refKey, err)
+		}
+	}
+
+	// 2. Atomically insert (or re-affirm) the published snapshot index. This
+	// upsert is the reader-visible commit: FindClosestSnapshotInfo can return
+	// the snapshot only once this lands, and every change it covers is still
+	// in the changes collection until prune.
+	setFields := bson.M{
+		"lamport":           info.Lamport,
+		"version_vector":    vv,
+		"has_external_body": info.HasExternalBody,
+		"compacted":         true,
+		"live_size":         info.LiveSize,
+	}
+	if info.HasExternalBody {
+		setFields["snapshot"] = nil
+	} else {
+		setFields["snapshot"] = compressed
+	}
+	if _, err := c.collection(ColSnapshots).UpdateOne(ctx, bson.M{
+		"project_id": info.ProjectID,
+		"doc_id":     info.DocID,
+		"server_seq": info.ServerSeq,
+	}, bson.M{
+		"$set":         setFields,
+		"$setOnInsert": bson.M{"created_at": now},
+	}, options.UpdateOne().SetUpsert(true)); err != nil {
+		return fmt.Errorf("publish snapshot of %s: %w", refKey, err)
+	}
+
+	// 3. Advance the history floor on the document, without constraining
+	// server_seq: a push that appended changes after the claim must keep its
+	// sequences. The guard keeps the floor monotonic. A document row written
+	// before this field existed has no snapshot_server_seq at all, and a
+	// range comparison never matches a missing field, so the missing case is
+	// matched explicitly.
+	if _, err := c.collection(ColDocuments).UpdateOne(ctx, bson.M{
+		"project_id": info.ProjectID,
+		"_id":        info.DocID,
+		"$or": []bson.M{
+			{"snapshot_server_seq": bson.M{"$lt": info.ServerSeq}},
+			{"snapshot_server_seq": bson.M{"$exists": false}},
+		},
+	}, bson.M{
+		"$set": bson.M{
+			"snapshot_server_seq": info.ServerSeq,
+			"compacted_at":        now,
+		},
+	}); err != nil {
+		return fmt.Errorf("advance snapshot floor of %s: %w", refKey, err)
+	}
+	c.docCache.Remove(refKey)
+
+	// 4. Move the generation to published. A zero match just means a retry
+	// already moved it.
+	if _, err := c.collection(ColCompactions).UpdateOne(ctx, bson.M{
+		"_id":    info.ID,
+		"status": string(database.CompactionStatusCandidate),
+	}, bson.M{
+		"$set": bson.M{
+			"status":     string(database.CompactionStatusPublished),
+			"updated_at": now,
+		},
+	}); err != nil {
+		return fmt.Errorf("publish compaction status of %s: %w", refKey, err)
+	}
+	info.Status = database.CompactionStatusPublished
+	info.UpdatedAt = now
+	return nil
+}
+
+// PruneCompactionChanges removes the history the published snapshot covers:
+// changes at or below the pinned server sequence and older snapshots.
+func (c *Client) PruneCompactionChanges(
+	ctx context.Context,
+	info *database.CompactionInfo,
+) (int64, error) {
+	refKey := info.RefKey()
+
+	res, err := c.collection(ColChanges).DeleteMany(ctx, bson.M{
+		"project_id": info.ProjectID,
+		"doc_id":     info.DocID,
+		"server_seq": bson.M{"$lte": info.ServerSeq},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("prune changes of %s: %w", refKey, err)
+	}
+
+	// Only snapshots older than the published one go; the snapshot at the
+	// pinned point is the new floor and must stay readable.
+	if _, err := c.collection(ColSnapshots).DeleteMany(ctx, bson.M{
+		"project_id": info.ProjectID,
+		"doc_id":     info.DocID,
+		"server_seq": bson.M{"$lt": info.ServerSeq},
+	}); err != nil {
+		return 0, fmt.Errorf("prune snapshots of %s: %w", refKey, err)
+	}
+	if _, err := c.collection(ColSnapshotBodies).DeleteMany(ctx, bson.M{
+		"project_id": info.ProjectID,
+		"doc_id":     info.DocID,
+		"server_seq": bson.M{"$lt": info.ServerSeq},
+	}); err != nil {
+		return 0, fmt.Errorf("prune snapshot bodies of %s: %w", refKey, err)
+	}
+
+	// The cache may still answer reads with the deleted changes; it is only
+	// ever consulted for ranges above the new floor, but drop it anyway.
+	c.changeCache.Remove(refKey)
+
+	return res.DeletedCount, nil
+}
+
+// DeleteCompactionInfo deletes the active generation record and its
+// candidate snapshot.
+func (c *Client) DeleteCompactionInfo(
+	ctx context.Context,
+	info *database.CompactionInfo,
+) error {
+	if _, err := c.collection(ColCompactionBodies).DeleteMany(ctx, bson.M{
+		"project_id": info.ProjectID,
+		"doc_id":     info.DocID,
+		"server_seq": info.ServerSeq,
+	}); err != nil {
+		return fmt.Errorf("delete compaction snapshot body of %s: %w", info.RefKey(), err)
+	}
+	if _, err := c.collection(ColCompactions).DeleteOne(ctx, bson.M{
+		"_id": info.ID,
+	}); err != nil {
+		return fmt.Errorf("delete compaction of %s: %w", info.RefKey(), err)
+	}
+	return nil
+}
+
+// FindLatestChangeInfo returns the latest stored change at or below the given
+// server sequence.
+func (c *Client) FindLatestChangeInfo(
+	ctx context.Context,
+	docRefKey types.DocRefKey,
+	serverSeq int64,
+) (*database.ChangeInfo, error) {
+	result := c.collection(ColChanges).FindOne(ctx, bson.M{
+		"project_id": docRefKey.ProjectID,
+		"doc_id":     docRefKey.DocID,
+		"server_seq": bson.M{"$lte": serverSeq},
+	}, options.FindOne().SetSort(bson.M{"server_seq": -1}))
+
+	info := &database.ChangeInfo{}
+	if err := result.Decode(info); err != nil {
+		if result.Err() == mongo.ErrNoDocuments {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("find latest change of %s: %w", docRefKey, err)
+	}
+	return info, nil
+}
+
+// FindClosestCompactedSnapshotInfo returns the latest compaction-published
+// snapshot at or below the given server sequence.
+func (c *Client) FindClosestCompactedSnapshotInfo(
+	ctx context.Context,
+	docRefKey types.DocRefKey,
+	serverSeq int64,
+) (*database.SnapshotInfo, error) {
+	result := c.collection(ColSnapshots).FindOne(ctx, bson.M{
+		"project_id": docRefKey.ProjectID,
+		"doc_id":     docRefKey.DocID,
+		"compacted":  true,
+		"server_seq": bson.M{"$lte": serverSeq},
+	}, options.FindOne().
+		SetSort(bson.M{"server_seq": -1}).
+		SetProjection(bson.M{"snapshot": 0}))
+
+	info := &database.SnapshotInfo{}
+	if err := result.Decode(info); err != nil {
+		if result.Err() == mongo.ErrNoDocuments {
+			info.VersionVector = time.NewVersionVector()
+			return info, nil
+		}
+		return nil, fmt.Errorf("find compacted snapshot before %d of %s: %w", serverSeq, docRefKey, err)
+	}
+	return info, nil
 }
 
 // FindLatestChangeInfoByActor returns the latest change created by given actorID.
@@ -2518,6 +2719,13 @@ func (c *Client) CreateSnapshotInfo(
 	}
 
 	if _, err := c.collection(ColSnapshots).InsertOne(ctx, docFields); err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			// A snapshot at this sequence already exists. A compaction
+			// generation racing the periodic snapshot path may already have
+			// published it; leave that row (and its compacted marker)
+			// untouched rather than overwriting it.
+			return nil
+		}
 		// Clean up orphaned body if metadata insert fails
 		if hasExternalBody {
 			_, _ = c.collection(ColSnapshotBodies).DeleteOne(ctx, bson.M{
@@ -3130,6 +3338,22 @@ func (c *Client) purgeDocumentInternals(
 	}
 	counts[ColVersionVectors] = res.DeletedCount
 
+	res, err = c.collection(ColCompactions).DeleteMany(ctx, bson.M{
+		"project_id": projectID,
+		"doc_id":     docID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("purge compactions of %s: %w", docID, err)
+	}
+	counts[ColCompactions] = res.DeletedCount
+
+	if _, err = c.collection(ColCompactionBodies).DeleteMany(ctx, bson.M{
+		"project_id": projectID,
+		"doc_id":     docID,
+	}); err != nil {
+		return nil, fmt.Errorf("purge compaction bodies of %s: %w", docID, err)
+	}
+
 	return counts, nil
 }
 
@@ -3140,18 +3364,6 @@ func (c *Client) collection(
 	return c.client.
 		Database(c.config.YorkieDatabase).
 		Collection(name, opts...)
-}
-
-// marshal encodes v with the registry the client writes with, so the bytes
-// match what an insert of v would send.
-func (c *Client) marshal(v any) (bson.Raw, error) {
-	buf := new(bytes.Buffer)
-	enc := bson.NewEncoder(bson.NewDocumentWriter(buf))
-	enc.SetRegistry(c.registry)
-	if err := enc.Encode(v); err != nil {
-		return nil, fmt.Errorf("encode bson: %w", err)
-	}
-	return buf.Bytes(), nil
 }
 
 // CreateInviteInfo creates a new reusable invite link for the project.

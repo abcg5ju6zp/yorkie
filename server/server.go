@@ -383,6 +383,15 @@ func (r *Yorkie) RegisterHousekeepingTasks(be *backend.Backend) error {
 	}
 
 	if err := be.Housekeeping.RegisterTask(interval, func(ctx context.Context) error {
+		// Even with automatic compaction disabled, an admin-forced
+		// compaction interrupted by a crash must still be recovered.
+		if be.Housekeeping.Config.DisableCompaction {
+			if _, err := documents.RecoverCompactions(ctx, be); err != nil {
+				return err
+			}
+			return nil
+		}
+
 		compactionState.Lock()
 		currentLastServerSeq := compactionState.lastServerSeq
 		currentLastID := compactionState.lastID

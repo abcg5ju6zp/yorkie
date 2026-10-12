@@ -63,6 +63,14 @@ type DocInfo struct {
 	// epoch changes, all prior checkpoints are invalidated.
 	Epoch int64 `bson:"epoch"`
 
+	// SnapshotServerSeq is the server sequence of the latest published
+	// compaction snapshot. Changes at or below this point are covered by
+	// that snapshot and may have been pruned; a client behind it receives
+	// the snapshot instead of changes. Zero means the document has never
+	// been compacted. Unlike Epoch, publishing this point does not reset
+	// ServerSeq, so changes appended concurrently keep their sequences.
+	SnapshotServerSeq int64 `bson:"snapshot_server_seq"`
+
 	// DisablePresence declares that this document does not accept presence
 	// put/clear. Written via $setOnInsert at first attach and immutable
 	// thereafter; the empty (false) value matches documents created before
@@ -88,19 +96,20 @@ func (info *DocInfo) DeepCopy() *DocInfo {
 	}
 
 	return &DocInfo{
-		ID:              info.ID,
-		ProjectID:       info.ProjectID,
-		Key:             info.Key,
-		ServerSeq:       info.ServerSeq,
-		Owner:           info.Owner,
-		Schema:          info.Schema,
-		CreatedAt:       info.CreatedAt,
-		AccessedAt:      info.AccessedAt,
-		UpdatedAt:       info.UpdatedAt,
-		RemovedAt:       info.RemovedAt,
-		CompactedAt:     info.CompactedAt,
-		Epoch:           info.Epoch,
-		DisablePresence: info.DisablePresence,
+		ID:                info.ID,
+		ProjectID:         info.ProjectID,
+		Key:               info.Key,
+		ServerSeq:         info.ServerSeq,
+		Owner:             info.Owner,
+		Schema:            info.Schema,
+		CreatedAt:         info.CreatedAt,
+		AccessedAt:        info.AccessedAt,
+		UpdatedAt:         info.UpdatedAt,
+		RemovedAt:         info.RemovedAt,
+		CompactedAt:       info.CompactedAt,
+		Epoch:             info.Epoch,
+		SnapshotServerSeq: info.SnapshotServerSeq,
+		DisablePresence:   info.DisablePresence,
 	}
 }
 

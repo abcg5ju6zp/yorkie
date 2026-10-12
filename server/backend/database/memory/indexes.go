@@ -19,19 +19,21 @@ package memory
 import "github.com/hashicorp/go-memdb"
 
 var (
-	tblClusterNodes   = "clusternodes"
-	tblUsers          = "users"
-	tblProjects       = "projects"
-	tblMembers        = "members"
-	tblInvites        = "invites"
-	tblClients        = "clients"
-	tblDocuments      = "documents"
-	tblSchemas        = "schemas"
-	tblChanges        = "changes"
-	tblSnapshots      = "snapshots"
-	tblVersionVectors = "versionvectors"
-	tblSnapshotBodies = "snapshot_bodies"
-	tblRevisions      = "revisions"
+	tblClusterNodes     = "clusternodes"
+	tblUsers            = "users"
+	tblProjects         = "projects"
+	tblMembers          = "members"
+	tblInvites          = "invites"
+	tblClients          = "clients"
+	tblDocuments        = "documents"
+	tblSchemas          = "schemas"
+	tblChanges          = "changes"
+	tblSnapshots        = "snapshots"
+	tblVersionVectors   = "versionvectors"
+	tblSnapshotBodies   = "snapshot_bodies"
+	tblCompactions      = "compactions"
+	tblCompactionBodies = "compaction_snapshot_bodies"
+	tblRevisions        = "revisions"
 )
 
 var schema = &memdb.DBSchema{
@@ -356,6 +358,56 @@ var schema = &memdb.DBSchema{
 							&memdb.StringFieldIndex{Field: "ClientID"},
 						},
 					},
+				},
+				"doc_id_server_seq": {
+					Name:   "doc_id_server_seq",
+					Unique: true,
+					Indexer: &memdb.CompoundIndex{
+						Indexes: []memdb.Indexer{
+							&memdb.StringFieldIndex{Field: "DocID"},
+							&memdb.IntFieldIndex{Field: "ServerSeq"},
+						},
+					},
+				},
+			},
+		},
+		tblCompactions: {
+			Name: tblCompactions,
+			Indexes: map[string]*memdb.IndexSchema{
+				"id": {
+					Name:    "id",
+					Unique:  true,
+					Indexer: &memdb.StringFieldIndex{Field: "ID"},
+				},
+				"doc_id": {
+					Name:    "doc_id",
+					Unique:  false,
+					Indexer: &memdb.StringFieldIndex{Field: "DocID"},
+				},
+				"project_id_doc_id": {
+					Name:   "project_id_doc_id",
+					Unique: true,
+					Indexer: &memdb.CompoundIndex{
+						Indexes: []memdb.Indexer{
+							&memdb.StringFieldIndex{Field: "ProjectID"},
+							&memdb.StringFieldIndex{Field: "DocID"},
+						},
+					},
+				},
+			},
+		},
+		tblCompactionBodies: {
+			Name: tblCompactionBodies,
+			Indexes: map[string]*memdb.IndexSchema{
+				"id": {
+					Name:    "id",
+					Unique:  true,
+					Indexer: &memdb.StringFieldIndex{Field: "ID"},
+				},
+				"doc_id": {
+					Name:    "doc_id",
+					Unique:  false,
+					Indexer: &memdb.StringFieldIndex{Field: "DocID"},
 				},
 				"doc_id_server_seq": {
 					Name:   "doc_id_server_seq",

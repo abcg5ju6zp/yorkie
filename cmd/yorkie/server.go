@@ -414,6 +414,12 @@ func init() {
 		server.DefaultHousekeepingCompactionMinChanges,
 		"minimum number of changes to compact a document for housekeeping run",
 	)
+	cmd.Flags().BoolVar(
+		&conf.Housekeeping.DisableCompaction,
+		"housekeeping-disable-compaction",
+		false,
+		"disable automatic document compaction by housekeeping (admin-forced compaction remains available)",
+	)
 	cmd.Flags().DurationVar(
 		&housekeepingProjectStatsRefreshInterval,
 		"housekeeping-project-stats-refresh-interval",

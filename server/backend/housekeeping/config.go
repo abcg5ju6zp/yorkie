@@ -39,6 +39,11 @@ type Config struct {
 	// CompactionMinChanges is the minimum number of changes to compact a document.
 	CompactionMinChanges int `yaml:"CompactionMinChanges"`
 
+	// DisableCompaction turns the automatic housekeeping compaction task
+	// off. Admin-forced compaction and recovery of an interrupted
+	// compaction remain available.
+	DisableCompaction bool `yaml:"DisableCompaction"`
+
 	// ProjectStatsRefreshInterval is the interval between project-stats refresh cycles.
 	// If empty or "0s", the project-stats refresh task is not registered.
 	ProjectStatsRefreshInterval string `yaml:"ProjectStatsRefreshInterval"`

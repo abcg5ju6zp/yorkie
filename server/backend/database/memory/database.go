@@ -36,6 +36,11 @@ import (
 	"github.com/yorkie-team/yorkie/server/backend/database"
 )
 
+// maxDocumentSize mirrors the MongoDB BSON document limit. memdb itself has
+// no such limit, but compaction applies the same guard so both backends
+// refuse an over-large candidate before touching the document.
+const maxDocumentSize = 16 * 1024 * 1024
+
 // DB is an in-memory database for testing or temporarily.
 type DB struct {
 	db *memdb.MemDB
@@ -1295,8 +1300,9 @@ func (d *DB) FindCompactionCandidates(
 	for raw := iter.Next(); raw != nil; raw = iter.Next() {
 		info := raw.(*database.DocInfo)
 
-		// Check if document has enough changes to compact
-		if info.ServerSeq < int64(compactionMinChanges) {
+		// Check if the history beyond the published snapshot floor has enough
+		// changes to compact; compaction no longer resets server_seq.
+		if info.ServerSeq-info.SnapshotServerSeq < int64(compactionMinChanges) {
 			continue
 		}
 
@@ -1886,80 +1892,500 @@ func (d *DB) CreateChangeInfos(
 	return docInfo, checkpoint, nil
 }
 
-// CompactChangeInfos stores the given compacted changes then updates the docInfo.
-func (d *DB) CompactChangeInfos(
-	ctx context.Context,
-	docInfo *database.DocInfo,
-	lastServerSeq int64,
-	changes []*change.Change,
+// CreateCompactionInfo claims a new compaction generation for a document.
+func (d *DB) CreateCompactionInfo(
+	_ context.Context,
+	info *database.CompactionInfo,
 ) error {
 	txn := d.db.Txn(true)
 	defer txn.Abort()
 
-	// 1. Purge the resources of the document.
-	if _, err := d.purgeDocumentInternals(ctx, docInfo.ProjectID, docInfo.ID, txn); err != nil {
-		return err
-	}
-
-	// 2. Store compacted change and update document
-	raw, err := txn.First(
-		tblDocuments,
-		"project_id_id",
-		docInfo.ProjectID.String(),
-		docInfo.ID.String(),
+	existing, err := txn.First(
+		tblCompactions,
+		"project_id_doc_id",
+		info.ProjectID.String(),
+		info.DocID.String(),
 	)
 	if err != nil {
-		return fmt.Errorf("compact document of %s: %w", docInfo.RefKey(), err)
+		return fmt.Errorf("claim compaction of %s: %w", info.RefKey(), err)
 	}
-	if raw == nil {
-		return fmt.Errorf("compact document of %s: %w", docInfo.RefKey(), database.ErrDocumentNotFound)
-	}
-	loadedDocInfo := raw.(*database.DocInfo).DeepCopy()
-	if loadedDocInfo.ServerSeq != lastServerSeq {
-		return fmt.Errorf("compact document of %s: %w", docInfo.RefKey(), database.ErrConflictOnUpdate)
+	if existing != nil {
+		return fmt.Errorf("claim compaction of %s: %w", info.RefKey(), database.ErrCompactionInProgress)
 	}
 
-	if len(changes) == 0 {
-		loadedDocInfo.ServerSeq = 0
-	} else if len(changes) == 1 {
-		loadedDocInfo.ServerSeq = 1
-	} else {
-		return fmt.Errorf("compact document of %s: invalid changes size %d", docInfo.RefKey(), len(changes))
-	}
-
-	for _, cn := range changes {
-		encodedOperations, err := database.EncodeOperations(cn.Operations())
-		if err != nil {
-			return err
-		}
-
-		if err := txn.Insert(tblChanges, &database.ChangeInfo{
-			ID:             newID(),
-			ProjectID:      docInfo.ProjectID,
-			DocID:          docInfo.ID,
-			ServerSeq:      loadedDocInfo.ServerSeq,
-			ClientSeq:      cn.ClientSeq(),
-			Lamport:        cn.ID().Lamport(),
-			ActorID:        types.ID(cn.ID().ActorID().String()),
-			VersionVector:  cn.ID().VersionVector(),
-			Message:        cn.Message(),
-			Operations:     encodedOperations,
-			PresenceChange: cn.PresenceChange(),
-		}); err != nil {
-			return fmt.Errorf("compact document of %s: %w", docInfo.RefKey(), err)
-		}
-	}
-
-	// 3. Update document
 	now := gotime.Now()
-	loadedDocInfo.Epoch++
-	loadedDocInfo.CompactedAt = now
-	if err := txn.Insert(tblDocuments, loadedDocInfo); err != nil {
-		return fmt.Errorf("compact document of %s: %w", docInfo.RefKey(), err)
+	info.CreatedAt = now
+	info.UpdatedAt = now
+	info.Status = database.CompactionStatusCandidate
+	if err := txn.Insert(tblCompactions, info.DeepCopy()); err != nil {
+		return fmt.Errorf("claim compaction of %s: %w", info.RefKey(), err)
 	}
 
 	txn.Commit()
 	return nil
+}
+
+// FindActiveCompactionInfo returns the active compaction generation of a
+// document.
+func (d *DB) FindActiveCompactionInfo(
+	_ context.Context,
+	docRefKey types.DocRefKey,
+) (*database.CompactionInfo, error) {
+	txn := d.db.Txn(false)
+	defer txn.Abort()
+
+	raw, err := txn.First(
+		tblCompactions,
+		"project_id_doc_id",
+		docRefKey.ProjectID.String(),
+		docRefKey.DocID.String(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find active compaction of %s: %w", docRefKey, err)
+	}
+	if raw == nil {
+		return nil, nil
+	}
+	return raw.(*database.CompactionInfo).DeepCopy(), nil
+}
+
+// FindRecoverableCompactionInfos returns active compaction generations after
+// the given generation ID.
+func (d *DB) FindRecoverableCompactionInfos(
+	_ context.Context,
+	limit int,
+	afterID types.ID,
+) ([]*database.CompactionInfo, error) {
+	txn := d.db.Txn(false)
+	defer txn.Abort()
+
+	it, err := txn.Get(tblCompactions, "id")
+	if err != nil {
+		return nil, fmt.Errorf("find recoverable compactions: %w", err)
+	}
+
+	var infos []*database.CompactionInfo
+	for raw := it.Next(); raw != nil; raw = it.Next() {
+		info := raw.(*database.CompactionInfo)
+		if afterID != database.ZeroID && info.ID <= afterID {
+			continue
+		}
+		infos = append(infos, info.DeepCopy())
+		if len(infos) >= limit {
+			break
+		}
+	}
+	return infos, nil
+}
+
+// SaveCompactionSnapshot stores the rebuilt candidate snapshot of the
+// generation without making it visible to snapshot readers.
+func (d *DB) SaveCompactionSnapshot(
+	_ context.Context,
+	info *database.CompactionInfo,
+	doc *document.InternalDocument,
+) error {
+	snapshot, err := converter.SnapshotToBytes(doc.RootObject(), doc.AllPresences())
+	if err != nil {
+		return err
+	}
+
+	compressed, err := database.CompressSnapshot(snapshot)
+	if err != nil {
+		return fmt.Errorf("compress compaction snapshot of %s: %w", info.RefKey(), err)
+	}
+
+	// Find an over-large candidate while the document is still intact.
+	if len(compressed) > maxDocumentSize {
+		return fmt.Errorf(
+			"compact document of %s: %d bytes: %w",
+			info.RefKey(), len(compressed), database.ErrChangeTooLarge,
+		)
+	}
+
+	txn := d.db.Txn(true)
+	defer txn.Abort()
+
+	raw, err := txn.First(tblCompactions, "id", info.ID.String())
+	if err != nil {
+		return fmt.Errorf("store compaction snapshot of %s: %w", info.RefKey(), err)
+	}
+	if raw == nil {
+		return fmt.Errorf("store compaction snapshot of %s: %w", info.RefKey(), database.ErrDocumentNotFound)
+	}
+	stored := raw.(*database.CompactionInfo).DeepCopy()
+
+	hasExternalBody := len(compressed) > database.SnapshotBodyThreshold
+	now := gotime.Now()
+
+	// Drop a previous attempt's body before storing the new one.
+	if old, err := txn.First(tblCompactionBodies, "doc_id_server_seq",
+		info.DocID.String(), info.ServerSeq,
+	); err != nil {
+		return fmt.Errorf("store compaction snapshot of %s: %w", info.RefKey(), err)
+	} else if old != nil {
+		if err := txn.Delete(tblCompactionBodies, old); err != nil {
+			return fmt.Errorf("store compaction snapshot of %s: %w", info.RefKey(), err)
+		}
+	}
+	if hasExternalBody {
+		if err := txn.Insert(tblCompactionBodies, &database.SnapshotBodyInfo{
+			ID:        newID(),
+			DocID:     info.DocID,
+			ProjectID: info.ProjectID,
+			ServerSeq: info.ServerSeq,
+			Snapshot:  compressed,
+			CreatedAt: now,
+		}); err != nil {
+			return fmt.Errorf("store compaction snapshot body of %s: %w", info.RefKey(), err)
+		}
+	}
+
+	liveSize := doc.DocSize().Live
+	stored.HasExternalBody = hasExternalBody
+	stored.LiveSize = int64(liveSize.Total())
+	stored.UpdatedAt = now
+	if !hasExternalBody {
+		stored.Snapshot = compressed
+	} else {
+		stored.Snapshot = nil
+	}
+	if err := txn.Insert(tblCompactions, stored); err != nil {
+		return fmt.Errorf("store compaction snapshot of %s: %w", info.RefKey(), err)
+	}
+
+	txn.Commit()
+
+	info.Snapshot = compressed
+	info.HasExternalBody = hasExternalBody
+	info.LiveSize = stored.LiveSize
+	info.UpdatedAt = now
+	return nil
+}
+
+// HasCompactionSnapshot reports whether the candidate snapshot of the
+// generation has already been stored.
+func (d *DB) HasCompactionSnapshot(
+	_ context.Context,
+	info *database.CompactionInfo,
+) (bool, error) {
+	if !info.HasExternalBody {
+		return len(info.Snapshot) > 0, nil
+	}
+
+	txn := d.db.Txn(false)
+	defer txn.Abort()
+	raw, err := txn.First(tblCompactionBodies, "doc_id_server_seq",
+		info.DocID.String(), info.ServerSeq,
+	)
+	if err != nil {
+		return false, fmt.Errorf("find compaction snapshot body of %s: %w", info.RefKey(), err)
+	}
+	return raw != nil, nil
+}
+
+// compactionSnapshotBytesLocked reads the stored candidate snapshot, assuming
+// an open transaction.
+func compactionSnapshotBytesLocked(
+	txn *memdb.Txn,
+	info *database.CompactionInfo,
+) ([]byte, error) {
+	if !info.HasExternalBody {
+		if len(info.Snapshot) > 0 {
+			return info.Snapshot, nil
+		}
+		return nil, fmt.Errorf(
+			"publish compaction snapshot of %s: %w", info.RefKey(), database.ErrSnapshotNotFound,
+		)
+	}
+
+	raw, err := txn.First(tblCompactionBodies, "doc_id_server_seq",
+		info.DocID.String(), info.ServerSeq,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find compaction snapshot body of %s: %w", info.RefKey(), err)
+	}
+	if raw == nil {
+		return nil, fmt.Errorf(
+			"publish compaction snapshot of %s: %w", info.RefKey(), database.ErrSnapshotNotFound,
+		)
+	}
+	return raw.(*database.SnapshotBodyInfo).Snapshot, nil
+}
+
+// PublishCompactionSnapshot publishes the candidate snapshot at the pinned
+// server sequence and advances the document's snapshot floor to it.
+func (d *DB) PublishCompactionSnapshot(
+	ctx context.Context,
+	info *database.CompactionInfo,
+) error {
+	txn := d.db.Txn(true)
+	defer txn.Abort()
+
+	gen, err := txn.First(tblCompactions, "id", info.ID.String())
+	if err != nil {
+		return fmt.Errorf("publish compaction snapshot of %s: %w", info.RefKey(), err)
+	}
+	if gen == nil {
+		return fmt.Errorf("publish compaction snapshot of %s: %w", info.RefKey(), database.ErrDocumentNotFound)
+	}
+	storedGen := gen.(*database.CompactionInfo).DeepCopy()
+
+	compressed, err := compactionSnapshotBytesLocked(txn, storedGen)
+	if err != nil {
+		return err
+	}
+
+	now := gotime.Now()
+
+	// 1. External body of the published snapshot.
+	if storedGen.HasExternalBody {
+		if old, _ := txn.First(tblSnapshotBodies, "doc_id_server_seq",
+			info.DocID.String(), info.ServerSeq,
+		); old != nil {
+			if err := txn.Delete(tblSnapshotBodies, old); err != nil {
+				return fmt.Errorf("publish snapshot body of %s: %w", info.RefKey(), err)
+			}
+		}
+		if err := txn.Insert(tblSnapshotBodies, &database.SnapshotBodyInfo{
+			ID:        newID(),
+			DocID:     info.DocID,
+			ProjectID: info.ProjectID,
+			ServerSeq: info.ServerSeq,
+			Snapshot:  compressed,
+			CreatedAt: now,
+		}); err != nil {
+			return fmt.Errorf("publish snapshot body of %s: %w", info.RefKey(), err)
+		}
+	}
+
+	// 2. Atomically replace the snapshot at the pinned point with the
+	// published, compacted one. Readers find it through the same lookup once
+	// the transaction commits.
+	if old, _ := txn.First(tblSnapshots, "doc_id_server_seq",
+		info.DocID.String(), info.ServerSeq,
+	); old != nil {
+		if err := txn.Delete(tblSnapshots, old); err != nil {
+			return fmt.Errorf("publish snapshot of %s: %w", info.RefKey(), err)
+		}
+	}
+
+	// With no opt-in client tracking the document, the persisted snapshot VV
+	// has no GC consumer. Persist an empty VV like CreateSnapshotInfo does.
+	vv := storedGen.VersionVector.DeepCopy()
+	hasOptIn, err := d.hasVersionVectorRow(txn, info.RefKey())
+	if err != nil {
+		return err
+	}
+	if !hasOptIn {
+		vv = time.NewVersionVector()
+	}
+
+	snapshotField := compressed
+	if storedGen.HasExternalBody {
+		snapshotField = nil
+	}
+	if err := txn.Insert(tblSnapshots, &database.SnapshotInfo{
+		ID:              newID(),
+		ProjectID:       info.ProjectID,
+		DocID:           info.DocID,
+		ServerSeq:       info.ServerSeq,
+		Lamport:         storedGen.Lamport,
+		VersionVector:   vv,
+		Snapshot:        snapshotField,
+		HasExternalBody: storedGen.HasExternalBody,
+		Compacted:       true,
+		LiveSize:        storedGen.LiveSize,
+		CreatedAt:       now,
+	}); err != nil {
+		return fmt.Errorf("publish snapshot of %s: %w", info.RefKey(), err)
+	}
+
+	// 3. Advance the history floor on the document without touching
+	// server_seq.
+	docRaw, err := txn.First(tblDocuments, "project_id_id",
+		info.ProjectID.String(), info.DocID.String(),
+	)
+	if err != nil {
+		return fmt.Errorf("advance snapshot floor of %s: %w", info.RefKey(), err)
+	}
+	if docRaw == nil {
+		return fmt.Errorf("advance snapshot floor of %s: %w", info.RefKey(), database.ErrDocumentNotFound)
+	}
+	docInfo := docRaw.(*database.DocInfo).DeepCopy()
+	if docInfo.SnapshotServerSeq < info.ServerSeq {
+		docInfo.SnapshotServerSeq = info.ServerSeq
+		docInfo.CompactedAt = now
+		if err := txn.Insert(tblDocuments, docInfo); err != nil {
+			return fmt.Errorf("advance snapshot floor of %s: %w", info.RefKey(), err)
+		}
+	}
+
+	// 4. Move the generation to published.
+	storedGen.Status = database.CompactionStatusPublished
+	storedGen.UpdatedAt = now
+	if err := txn.Insert(tblCompactions, storedGen); err != nil {
+		return fmt.Errorf("publish compaction status of %s: %w", info.RefKey(), err)
+	}
+
+	txn.Commit()
+
+	info.Status = database.CompactionStatusPublished
+	info.UpdatedAt = now
+	return nil
+}
+
+// PruneCompactionChanges removes the history the published snapshot covers:
+// changes at or below the pinned server sequence and older snapshots.
+func (d *DB) PruneCompactionChanges(
+	_ context.Context,
+	info *database.CompactionInfo,
+) (int64, error) {
+	txn := d.db.Txn(true)
+	defer txn.Abort()
+
+	var deleted int64
+	changeIt, err := txn.Get(tblChanges, "doc_id", info.DocID.String())
+	if err != nil {
+		return 0, fmt.Errorf("prune changes of %s: %w", info.RefKey(), err)
+	}
+	for raw := changeIt.Next(); raw != nil; raw = changeIt.Next() {
+		changeInfo := raw.(*database.ChangeInfo)
+		if changeInfo.ServerSeq <= info.ServerSeq {
+			if err := txn.Delete(tblChanges, changeInfo); err != nil {
+				return 0, fmt.Errorf("prune changes of %s: %w", info.RefKey(), err)
+			}
+			deleted++
+		}
+	}
+
+	for _, table := range []string{tblSnapshots, tblSnapshotBodies} {
+		it, err := txn.Get(table, "doc_id", info.DocID.String())
+		if err != nil {
+			return 0, fmt.Errorf("prune snapshots of %s: %w", info.RefKey(), err)
+		}
+		var stale []any
+		for raw := it.Next(); raw != nil; raw = it.Next() {
+			switch v := raw.(type) {
+			case *database.SnapshotInfo:
+				if v.ServerSeq < info.ServerSeq {
+					stale = append(stale, v)
+				}
+			case *database.SnapshotBodyInfo:
+				if v.ServerSeq < info.ServerSeq {
+					stale = append(stale, v)
+				}
+			}
+		}
+		for _, v := range stale {
+			if err := txn.Delete(table, v); err != nil {
+				return 0, fmt.Errorf("prune snapshots of %s: %w", info.RefKey(), err)
+			}
+		}
+	}
+
+	txn.Commit()
+	return deleted, nil
+}
+
+// DeleteCompactionInfo deletes the active generation record and its
+// candidate snapshot.
+func (d *DB) DeleteCompactionInfo(
+	_ context.Context,
+	info *database.CompactionInfo,
+) error {
+	txn := d.db.Txn(true)
+	defer txn.Abort()
+
+	if raw, _ := txn.First(tblCompactionBodies, "doc_id_server_seq",
+		info.DocID.String(), info.ServerSeq,
+	); raw != nil {
+		if err := txn.Delete(tblCompactionBodies, raw); err != nil {
+			return fmt.Errorf("delete compaction snapshot body of %s: %w", info.RefKey(), err)
+		}
+	}
+
+	raw, err := txn.First(tblCompactions, "id", info.ID.String())
+	if err != nil {
+		return fmt.Errorf("delete compaction of %s: %w", info.RefKey(), err)
+	}
+	if raw != nil {
+		if err := txn.Delete(tblCompactions, raw); err != nil {
+			return fmt.Errorf("delete compaction of %s: %w", info.RefKey(), err)
+		}
+	}
+
+	txn.Commit()
+	return nil
+}
+
+// FindLatestChangeInfo returns the latest stored change at or below the given
+// server sequence.
+func (d *DB) FindLatestChangeInfo(
+	_ context.Context,
+	docRefKey types.DocRefKey,
+	serverSeq int64,
+) (*database.ChangeInfo, error) {
+	txn := d.db.Txn(false)
+	defer txn.Abort()
+
+	iterator, err := txn.ReverseLowerBound(
+		tblChanges,
+		"doc_id_server_seq",
+		docRefKey.DocID.String(),
+		serverSeq,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find latest change of %s: %w", docRefKey, err)
+	}
+	if raw := iterator.Next(); raw != nil {
+		return raw.(*database.ChangeInfo).DeepCopy(), nil
+	}
+	return nil, nil
+}
+
+// FindClosestCompactedSnapshotInfo returns the latest compaction-published
+// snapshot at or below the given server sequence.
+func (d *DB) FindClosestCompactedSnapshotInfo(
+	_ context.Context,
+	docRefKey types.DocRefKey,
+	serverSeq int64,
+) (*database.SnapshotInfo, error) {
+	txn := d.db.Txn(false)
+	defer txn.Abort()
+
+	iterator, err := txn.ReverseLowerBound(
+		tblSnapshots,
+		"doc_id_server_seq",
+		docRefKey.DocID.String(),
+		serverSeq,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find compacted snapshot before %d of %s: %w", serverSeq, docRefKey, err)
+	}
+
+	for raw := iterator.Next(); raw != nil; raw = iterator.Next() {
+		info := raw.(*database.SnapshotInfo)
+		if info.DocID != docRefKey.DocID {
+			break
+		}
+		if info.Compacted {
+			return &database.SnapshotInfo{
+				ID:              info.ID,
+				ProjectID:       info.ProjectID,
+				DocID:           info.DocID,
+				ServerSeq:       info.ServerSeq,
+				Lamport:         info.Lamport,
+				VersionVector:   info.VersionVector.DeepCopy(),
+				HasExternalBody: info.HasExternalBody,
+				Compacted:       true,
+				LiveSize:        info.LiveSize,
+				CreatedAt:       info.CreatedAt,
+			}, nil
+		}
+	}
+
+	return &database.SnapshotInfo{VersionVector: time.NewVersionVector()}, nil
 }
 
 // FindLatestChangeInfoByActor returns the latest change created by given actorID.
@@ -2125,6 +2551,18 @@ func (d *DB) CreateSnapshotInfo(
 		vv = time.NewVersionVector()
 	}
 
+	// A snapshot at this sequence may already exist (the periodic snapshot
+	// path racing a compaction publication). Leave it untouched so a
+	// compacted snapshot keeps its marker.
+	if existing, err := txn.First(tblSnapshots, "doc_id_server_seq",
+		docRefKey.DocID.String(), doc.Checkpoint().ServerSeq,
+	); err != nil {
+		return fmt.Errorf("create snapshot of %s: %w", docRefKey, err)
+	} else if existing != nil {
+		txn.Commit()
+		return nil
+	}
+
 	liveSize := doc.DocSize().Live
 	if err := txn.Insert(tblSnapshots, &database.SnapshotInfo{
 		ID:              newID(),
@@ -2223,6 +2661,7 @@ func (d *DB) FindClosestSnapshotInfo(
 				Lamport:         info.Lamport,
 				VersionVector:   info.VersionVector,
 				HasExternalBody: info.HasExternalBody,
+				Compacted:       info.Compacted,
 				LiveSize:        info.LiveSize,
 				CreatedAt:       info.CreatedAt,
 			}
@@ -2713,6 +3152,18 @@ func (d *DB) purgeDocumentInternals(
 		return nil, fmt.Errorf("purge version vectors of %s: %w", docID, err)
 	}
 	counts[tblVersionVectors] = int64(count)
+
+	count, err = txn.DeleteAll(tblCompactions, "doc_id", docID.String())
+	if err != nil {
+		return nil, fmt.Errorf("purge compactions of %s: %w", docID, err)
+	}
+	counts[tblCompactions] = int64(count)
+
+	count, err = txn.DeleteAll(tblCompactionBodies, "doc_id", docID.String())
+	if err != nil {
+		return nil, fmt.Errorf("purge compaction bodies of %s: %w", docID, err)
+	}
+	counts[tblCompactionBodies] = int64(count)
 
 	return counts, nil
 }

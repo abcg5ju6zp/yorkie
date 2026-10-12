@@ -59,8 +59,13 @@ Housekeeping:
   # Values <= 1 fall back to sequential execution (default: 8)
   DeactivateConcurrency: 8
 
-  # Minimum number of changes required to compact a document (default: 1000)
+  # Minimum number of changes beyond the published snapshot floor required
+  # to compact a document (default: 1000)
   CompactionMinChanges: 1000
+
+  # Disable automatic document compaction. Interrupted compactions are still
+  # recovered and admin-forced compaction remains available (default: false)
+  DisableCompaction: false
 ```
 
 ### Client Deactivation for Efficient Garbage Collection
@@ -110,23 +115,43 @@ In CRDT systems, garbage collection relies on `minVersionVector` to determine wh
 
 Document compaction reduces storage overhead by:
 
-1. Removing old change history
-2. Creating a new initial change that represents the current document state
-3. Maintaining document integrity while reducing metadata size
+1. Publishing a snapshot of the current document state at the pinned server
+   sequence
+2. Removing the change history that snapshot covers (older sequences only)
+3. Keeping the server sequence monotonic, so concurrent PushPull traffic and
+   connected clients keep working without a detach/re-attach
 
 #### Compaction Process
 
+Compaction runs as a persisted, at-most-one-active **generation** per
+document (see [document-epoch.md](./document-epoch.md)):
+
+```text
+claim (pin serverSeq + version vector, unique generation row)
+  -> build + validate an isolated candidate snapshot (invisible to readers)
+  -> atomically publish the snapshot index (snapshot_server_seq floor)
+  -> prune changes <= pinned seq and older snapshots
+  -> delete the generation
+```
+
 ```go
-// Pseudocode for document compaction
+// Pseudocode for the housekeeping compaction task
+recoverInterruptedCompactions() // resume/cancel generations left by a crash
 for each project {
     candidates = FindCompactionCandidates(project, minChanges: 1000)
     for each document {
         if !IsDocumentAttached(document) {
-            CompactDocument(document)
+            CompactDocument(document) // claims or resumes the one generation
         }
     }
 }
 ```
+
+Every stage is idempotent and continues from database facts, so an uncertain
+database response, a duplicate trigger on another node or a restart simply
+resumes the same generation. A pull whose checkpoint is at or below the
+published floor receives the snapshot instead of a change range with a hole.
+
 
 #### Compaction Criteria
 

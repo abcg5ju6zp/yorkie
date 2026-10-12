@@ -177,8 +177,8 @@ func TestClient(t *testing.T) {
 		testcases.RunCreateChangeInfosTest(t, cli, dummyProjectID)
 	})
 
-	t.Run("CompactChangeInfos test", func(t *testing.T) {
-		testcases.RunCompactChangeInfosTest(t, cli, dummyProjectID)
+	t.Run("CompactionGeneration test", func(t *testing.T) {
+		testcases.RunCompactionGenerationTest(t, cli, dummyProjectID)
 	})
 
 	t.Run("SnapshotLiveSize test", func(t *testing.T) {
@@ -324,13 +324,13 @@ func TestClient_AttachedClientLookupDoesNotCacheStaleRows(t *testing.T) {
 	require.ErrorIs(t, cached.EnsureDocumentAttached(docInfo.ID), database.ErrDocumentNotAttached)
 }
 
-func TestClient_CompactChangeInfosAcrossNodes(t *testing.T) {
+func TestClient_CompactionAcrossNodes(t *testing.T) {
 	// Two clients on one database stand in for two server nodes: each keeps
 	// its own document cache.
 	nodeA := setupTestWithDummyData(t)
 	nodeB := setupTestWithDummyData(t)
 
-	testcases.RunCompactChangeInfosAcrossNodesTest(t, nodeA, nodeB, dummyProjectID)
+	testcases.RunCompactionAcrossNodesTest(t, nodeA, nodeB, dummyProjectID)
 }
 
 func TestClient_RotateProjectKeys(t *testing.T) {

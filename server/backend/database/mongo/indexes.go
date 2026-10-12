@@ -50,6 +50,11 @@ const (
 	ColVersionVectors = "versionvectors"
 	// ColSnapshotBodies represents the snapshot_bodies collection in the database.
 	ColSnapshotBodies = "snapshot_bodies"
+	// ColCompactions represents the active compaction generations collection.
+	ColCompactions = "compactions"
+	// ColCompactionBodies represents the compaction candidate snapshot bodies
+	// collection.
+	ColCompactionBodies = "compaction_snapshot_bodies"
 	// ColRevisions represents the revisions collection in the database.
 	ColRevisions = "revisions"
 )
@@ -67,6 +72,8 @@ var Collections = []string{
 	ColChanges,
 	ColSnapshots,
 	ColSnapshotBodies,
+	ColCompactions,
+	ColCompactionBodies,
 	ColVersionVectors,
 	ColRevisions,
 }
@@ -237,9 +244,41 @@ var collectionInfos = []collectionInfo{
 				{Key: "server_seq", Value: int32(1)},
 			},
 			Options: options.Index().SetUnique(true),
+		}, {
+			// Covers the history-floor lookup (latest compacted snapshot at
+			// or below a server sequence). It indexes only compaction
+			// snapshots, so never-compacted documents cost nothing.
+			Keys: bson.D{
+				{Key: "doc_id", Value: int32(1)},
+				{Key: "server_seq", Value: int32(-1)},
+			},
+			Options: options.Index().
+				SetPartialFilterExpression(bson.M{"compacted": true}).
+				SetName("doc_id_compacted_server_seq"),
 		}},
 	}, {
 		name: ColSnapshotBodies,
+		indexes: []mongo.IndexModel{{
+			Keys: bson.D{
+				{Key: "doc_id", Value: int32(1)}, // shard key: [doc_id]
+				{Key: "project_id", Value: int32(1)},
+				{Key: "server_seq", Value: int32(1)},
+			},
+			Options: options.Index().SetUnique(true),
+		}},
+	}, {
+		name: ColCompactions,
+		indexes: []mongo.IndexModel{{
+			// A row exists only while a generation is active, so uniqueness
+			// on the document is the cross-node single-active guarantee.
+			Keys: bson.D{
+				{Key: "project_id", Value: int32(1)},
+				{Key: "doc_id", Value: int32(1)},
+			},
+			Options: options.Index().SetUnique(true),
+		}},
+	}, {
+		name: ColCompactionBodies,
 		indexes: []mongo.IndexModel{{
 			Keys: bson.D{
 				{Key: "doc_id", Value: int32(1)}, // shard key: [doc_id]

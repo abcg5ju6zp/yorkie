@@ -856,6 +856,16 @@ func TestDocumentWithInitialRoot(t *testing.T) {
 		d2 := document.New(helper.TestKey(t))
 		assert.NoError(t, c2.Attach(ctx, d2))
 		assert.Equal(t, `{"c":1000}`, d2.Marshal())
-		assert.Equal(t, int64(2), d2.Checkpoint().ServerSeq)
+
+		// Compaction keeps the server sequence monotonic: the new attach
+		// receives the published snapshot at the pinned sequence (1003) plus
+		// its own attach change, and is caught up to the current head.
+		project, err := defaultServer.DefaultProject(ctx)
+		assert.NoError(t, err)
+		docInfo, err := defaultServer.Backend().DB.FindDocInfoByKey(ctx, project.ID, d1.Key())
+		assert.NoError(t, err)
+		assert.Equal(t, int64(1003), docInfo.SnapshotServerSeq)
+		assert.Equal(t, docInfo.ServerSeq, d2.Checkpoint().ServerSeq)
+		assert.GreaterOrEqual(t, d2.Checkpoint().ServerSeq, int64(1003))
 	})
 }

@@ -50,6 +50,12 @@ type SnapshotInfo struct {
 	// (in the snapshot_bodies collection) instead of inline.
 	HasExternalBody bool `bson:"has_external_body"`
 
+	// Compacted marks snapshots published by a compaction generation. The
+	// server sequence of the latest compacted snapshot is the history
+	// floor: changes at or below it are covered by the snapshot and may
+	// have been pruned. Periodic snapshots leave this false.
+	Compacted bool `bson:"compacted,omitempty"`
+
 	// LiveSize is the live size (data and metadata, without garbage) of the
 	// document at ServerSeq, in bytes. The push path reads it to enforce
 	// MaxSizePerDocument. Zero means unknown: snapshots written before the
@@ -75,6 +81,7 @@ func (i *SnapshotInfo) DeepCopy() *SnapshotInfo {
 		VersionVector:   i.VersionVector,
 		Snapshot:        i.Snapshot,
 		HasExternalBody: i.HasExternalBody,
+		Compacted:       i.Compacted,
 		LiveSize:        i.LiveSize,
 		CreatedAt:       i.CreatedAt,
 	}

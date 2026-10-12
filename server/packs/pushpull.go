@@ -96,6 +96,12 @@ var (
 	// document's epoch. This happens after compaction resets the document — the
 	// client must detach and re-attach to receive the compacted state.
 	ErrEpochMismatch = errors.FailedPrecond("epoch mismatch").WithCode("ErrEpochMismatch")
+
+	// errSnapshotFloorAhead is returned internally by pullChangeInfos when the
+	// changes it would return start at or behind a published compaction
+	// snapshot whose covered history has been pruned. preparePack answers
+	// with that snapshot instead.
+	errSnapshotFloorAhead = stderrors.New("snapshot floor is ahead of the client checkpoint")
 )
 
 // PushPull stores the given changes and returns accumulated changes of the
@@ -610,6 +616,12 @@ func preparePack(
 			initialServerSeq,
 		)
 		if err != nil {
+			// The history behind the client's checkpoint was compacted away:
+			// answer with the published snapshot instead of a change range
+			// with a hole in it.
+			if stderrors.Is(err, errSnapshotFloorAhead) {
+				return pullSnapshot(ctx, be, clientInfo, docInfo, reqPack, cpAfterPush, initialServerSeq, opts)
+			}
 			return nil, err
 		}
 
@@ -709,6 +721,24 @@ func pullChangeInfos(
 	)
 	if err != nil {
 		return change.InitialCheckpoint, nil, err
+	}
+
+	// Check the history floor after the change fetch, so a prune that another
+	// node commits in between is observed: when the client is at or below a
+	// published compaction snapshot, part of the requested range is gone and
+	// the caller must answer with that snapshot instead. The floor is read
+	// from the database (it is not cached) so it is visible immediately on
+	// every node.
+	floor, err := be.DB.FindClosestCompactedSnapshotInfo(
+		ctx,
+		docInfo.RefKey(),
+		initialServerSeq,
+	)
+	if err != nil {
+		return change.InitialCheckpoint, nil, err
+	}
+	if floor.ID != "" && floor.ServerSeq > reqPack.Checkpoint.ServerSeq {
+		return change.InitialCheckpoint, nil, errSnapshotFloorAhead
 	}
 
 	// NOTE(hackerwins, humdrum): Remove changes from the pulled if the client already has them.

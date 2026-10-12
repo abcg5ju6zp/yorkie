@@ -146,8 +146,8 @@ func TestDB(t *testing.T) {
 		testcases.RunCreateChangeInfosTest(t, db, projectID)
 	})
 
-	t.Run("CompactChangeInfos test", func(t *testing.T) {
-		testcases.RunCompactChangeInfosTest(t, db, projectID)
+	t.Run("CompactionGeneration test", func(t *testing.T) {
+		testcases.RunCompactionGenerationTest(t, db, projectID)
 	})
 
 	t.Run("SnapshotLiveSize test", func(t *testing.T) {

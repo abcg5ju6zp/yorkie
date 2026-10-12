@@ -2,8 +2,16 @@
 title: document-epoch
 target-version: 0.7.3
 ---
-
 # Document Epoch
+
+> **Update (atomic snapshot compaction).** Compaction no longer resets
+> `serverSeq` or bumps the epoch. It pins the current server sequence,
+> publishes a snapshot at that point and prunes only the covered history;
+> changes appended concurrently keep their sequences and clients behind the
+> new snapshot floor receive the snapshot instead of a change range. The
+> epoch fields and checks below remain in place for compatibility but are
+> no longer triggered by compaction. See
+> [Atomic snapshot compaction](#atomic-snapshot-compaction-current).
 
 ## Summary
 
@@ -209,3 +217,73 @@ func preparePack(...) {
 | Older SDK versions do not recognize `ErrEpochMismatch` | They fall through to the existing `ErrInvalidServerSeq` behavior — no worse than today |
 | Epoch counter overflows | `int64` supports over 9 × 10¹⁸ compactions — practically unlimited |
 | Stale-epoch push pollutes in-memory cache before `preparePack` detects mismatch | `pushPack` checks epoch before `CreateChangeInfos` and discards stale changes (see "Epoch Check Placement") |
+
+## Atomic snapshot compaction (current)
+
+### Why the epoch reset was replaced
+
+Resetting `serverSeq` and forcing every connected client through
+`ErrEpochMismatch` → detach/re-attach was disruptive, and the underlying
+implementation wrote a snapshot and pruned history in two separate steps.
+A snapshot write that succeeded while the prune failed (or a PushPull that
+appended between the two) left clients reading a snapshot whose sequence no
+longer matched their history.
+
+Compaction now publishes a snapshot at the current head and prunes the
+covered history in an ordered, recoverable sequence, without touching
+`serverSeq` or the epoch.
+
+### Generation state machine
+
+A **compaction generation** is a persisted row (the `compactions`
+collection / memory table), one active row per document at most. A unique
+index on `(project_id, doc_id)` is the cross-node guarantee that only one
+generation runs at a time: a housekeeping cycle, an admin force and a
+compaction RPC on another node all converge on the same generation instead
+of starting a second one.
+
+```text
+claim (pin serverSeq + lamport + version vector)
+  -> candidate (replay changes up to the pinned seq, validate, store invisibly)
+  -> published (atomic upsert of the snapshot row + document floor advance)
+  -> prune (delete changes <= pinned seq and older snapshots)
+  -> delete generation
+```
+
+- **Pin:** the claim reads the document head and the last stored change at
+  that sequence. The generation's `serverSeq`, lamport and version vector
+  never change afterwards; a PushPull that appends after the claim is not
+  part of the generation.
+- **Isolated candidate:** the candidate snapshot is rebuilt by replaying
+  only the changes within the pinned point and stored in a separate
+  collection. Published-snapshot readers (`FindClosestSnapshotInfo`) cannot
+  see it. Content is validated by a YSON rebuild/round-trip before saving.
+  A build or size failure deletes the generation and the candidate; the
+  last readable snapshot is untouched.
+- **Atomic publish:** the snapshot row upsert is the reader-visible commit.
+  The document's `snapshot_server_seq` floor advances to the pinned seq
+  without constraining `server_seq`, so concurrent pushes keep their
+  sequences.
+- **Prune:** only changes at or below the pinned seq (covered by the
+  published snapshot) and older snapshots are deleted; appended changes are
+  never touched.
+- **Idempotency and recovery:** each stage re-checks database facts
+  (candidate stored? snapshot row + floor present? covered changes gone?)
+  before writing, so an uncertain save/publish/prune response simply
+  resumes the same generation. Rows left by a crashed process are reclaimed
+  by a recovery pass at the start of every housekeeping cycle.
+
+### Read compatibility
+
+- `DocInfo.SnapshotServerSeq` is the history floor.
+- A pull whose client checkpoint is at or below the floor receives the
+  published snapshot (the floor lookup reads the database directly, so it is
+  visible on every cluster node immediately).
+- Document rebuilds (`BuildInternalDocForServerSeq`) ignore a cached
+  document below the floor and rebuild from the closest published snapshot.
+- Presence-only sequences keep their semantics: they are not pruned as
+  operations, and a document whose stored history contains no operation
+  change compacts as a no-op.
+- `--housekeeping-disable-compaction` turns automatic compaction off; an
+  interrupted generation is still recovered, and admin-forced compaction
+  remains available.

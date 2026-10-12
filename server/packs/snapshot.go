@@ -80,6 +80,22 @@ func BuildInternalDocForServerSeq(
 		}
 	}
 
+	// A compaction on another node may have published a snapshot floor and
+	// pruned the changes below it after this node cached a document. A
+	// cached document below that floor cannot replay up to serverSeq (part
+	// of its change range is gone), so drop it and rebuild from the closest
+	// published snapshot. The floor is read from the database, not the
+	// possibly stale document cache.
+	if doc != nil {
+		floor, floorErr := be.DB.FindClosestCompactedSnapshotInfo(ctx, docKey, serverSeq)
+		if floorErr != nil {
+			return nil, floorErr
+		}
+		if floor.ID != "" && floor.ServerSeq > doc.Checkpoint().ServerSeq {
+			doc = nil
+		}
+	}
+
 	// NOTE(hackerwins): If the document is already in the cache, we can skip
 	// the database query and use the cached document. If the document's server
 	// sequence in the cache is greater than the given server sequence, we can't
