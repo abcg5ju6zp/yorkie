@@ -205,6 +205,10 @@ func TestClient(t *testing.T) {
 		testcases.RunFindCandidatesTest(t, cli, dummyProjectID)
 	})
 
+	t.Run("RunRetirementGeneration test", func(t *testing.T) {
+		testcases.RunRetirementGenerationTest(t, cli, dummyProjectID)
+	})
+
 	t.Run("FindCompactionCandidates test", func(t *testing.T) {
 		testcases.RunFindCompactionCandidatesTest(t, cli, dummyProjectID)
 	})

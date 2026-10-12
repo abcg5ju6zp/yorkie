@@ -35,6 +35,7 @@ import (
 	"github.com/yorkie-team/yorkie/server/backend/database/mongo"
 	"github.com/yorkie-team/yorkie/server/clients"
 	"github.com/yorkie-team/yorkie/server/documents"
+	"github.com/yorkie-team/yorkie/server/logging"
 	"github.com/yorkie-team/yorkie/server/packs"
 	"github.com/yorkie-team/yorkie/server/rpc/auth"
 )
@@ -131,12 +132,24 @@ func (s *clusterServer) DetachDocument(
 		return nil, ErrDocumentKeyMismatch
 	}
 
-	if _, err := packs.PushPull(ctx, s.backend, project, clientInfo, refKey, pack, packs.PushPullOptions{
+	pulled, err := packs.PushPull(ctx, s.backend, project, clientInfo, refKey, pack, packs.PushPullOptions{
 		Mode:            types.SyncModePushOnly,
 		Status:          status,
 		DisablePresence: docInfo.DisablePresence,
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, err
+	}
+
+	// A detach that retired the document (RemoveOnDetach) or landed on a
+	// generation already retired converges its Watches, so the deactivation
+	// fan-out closes Watch streams instead of leaving a retired Watch behind.
+	if pulled.IsRemoved {
+		if retired, convErr := documents.FindDocInfoByRefKey(ctx, s.backend, refKey); convErr != nil {
+			logging.From(ctx).Warnf("load retired document %s: %v", refKey, convErr)
+		} else if convErr := documents.ConvergeRetiredDocument(ctx, s.backend, retired); convErr != nil {
+			logging.From(ctx).Warnf("converge retired document %s: %v", refKey, convErr)
+		}
 	}
 
 	// NOTE: No cache invalidation is broadcast here. This handler is only
@@ -384,6 +397,21 @@ func (s *clusterServer) InvalidateCache(
 	cacheType := converter.FromCacheType(req.Msg.CacheType)
 	if mongoClient, ok := s.backend.DB.(*mongo.Client); ok {
 		mongoClient.InvalidateCache(cacheType, req.Msg.Key)
+	}
+
+	// A document invalidation is the retirement generation's cluster-wide
+	// convergence signal: keyed by DocRefKey, it ends every Watch this node
+	// still serves for the document and drops its snapshot cache, so a
+	// broadcast that failed on the removing node reaches it on a retry and a
+	// long-disconnected Watch cannot keep serving the old copy. It can never
+	// address a same-key document created later, which has a different DocID.
+	if cacheType == types.CacheTypeDocument {
+		if refKey, err := types.ParseDocRefKey(req.Msg.Key); err != nil {
+			logging.From(ctx).Warnf("invalidate document cache %s: %v", req.Msg.Key, err)
+		} else {
+			s.backend.Cache.Snapshot.Remove(refKey)
+			s.backend.PubSub.CloseDocument(ctx, refKey)
+		}
 	}
 
 	return connect.NewResponse(&api.InvalidateCacheResponse{

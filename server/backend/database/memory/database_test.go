@@ -174,6 +174,10 @@ func TestDB(t *testing.T) {
 		testcases.RunPurgeDocument(t, db, projectID)
 	})
 
+	t.Run("RunRetirementGeneration test", func(t *testing.T) {
+		testcases.RunRetirementGenerationTest(t, db, projectID)
+	})
+
 	t.Run("RunFindCandidates test", func(t *testing.T) {
 		testcases.RunFindCandidatesTest(t, db, projectID)
 	})

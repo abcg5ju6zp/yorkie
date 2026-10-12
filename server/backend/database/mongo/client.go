@@ -244,6 +244,15 @@ func (c *Client) InvalidateCache(cacheType types.CacheType, key string) {
 		} else {
 			logging.DefaultLogger().Warnf("invalidate client cache %s: %v", key, err)
 		}
+	case types.CacheTypeDocument:
+		// A retirement invalidation is keyed by the generation's DocID, so
+		// dropping the cached DocInfo here can never drop a same-key document
+		// a later generation created.
+		if refKey, err := types.ParseDocRefKey(key); err == nil {
+			c.docCache.Remove(refKey)
+		} else {
+			logging.DefaultLogger().Warnf("invalidate document cache %s: %v", key, err)
+		}
 	}
 }
 
@@ -1497,8 +1506,11 @@ func (c *Client) FindCompactionCandidates(
 ) ([]*database.DocInfo, int64, types.ID, error) {
 	// Use (server_seq, _id) for cursor-based pagination to leverage the compound index.
 	// Query: (server_seq > lastServerSeq) OR (server_seq = lastServerSeq AND _id > lastDocID)
+	// Retired generations are excluded: their history is retained for offline
+	// deletion recognition until the deferred purge, not compacted.
 	filter := bson.M{
 		"server_seq": bson.M{"$gte": compactionMinChanges},
+		"removed_at": bson.M{"$exists": false},
 		"$or": []bson.M{
 			{"server_seq": bson.M{"$gt": lastServerSeq}},
 			{
@@ -1593,6 +1605,21 @@ func (c *Client) FindOrCreateDocInfo(
 	docKey key.Key,
 	disablePresence bool,
 ) (*database.DocInfo, error) {
+	// A retired generation that has not been purged still owns its key for
+	// the offline recovery window. Refuse to create a same-key document
+	// instead of starting a new generation late pushes or a deferred purge
+	// could confuse with the retired one.
+	retired := c.collection(ColDocuments).FindOne(ctx, bson.M{
+		"project_id": clientRefKey.ProjectID,
+		"key":        docKey,
+		"removed_at": bson.M{"$exists": true},
+	})
+	if err := retired.Err(); err == nil {
+		return nil, fmt.Errorf("find or create document of %s: %w", docKey, database.ErrDocumentRetired)
+	} else if err != mongo.ErrNoDocuments {
+		return nil, fmt.Errorf("find retired document of %s: %w", docKey, err)
+	}
+
 	filter := bson.M{
 		"project_id": clientRefKey.ProjectID,
 		"key":        docKey,
@@ -1751,29 +1778,170 @@ func (c *Client) FindDocInfoByRefKey(
 	return info, nil
 }
 
-// UpdateDocInfoStatusToRemoved updates the document status to removed.
+// FindRetiredDocInfoByKey finds the retired (removed, not yet purged)
+// document generation of the given key.
+func (c *Client) FindRetiredDocInfoByKey(
+	ctx context.Context,
+	projectID types.ID,
+	docKey key.Key,
+) (*database.DocInfo, error) {
+	result := c.collection(ColDocuments).FindOne(ctx, bson.M{
+		"project_id": projectID,
+		"key":        docKey,
+		"removed_at": bson.M{"$exists": true},
+	})
+	if result.Err() == mongo.ErrNoDocuments {
+		return nil, fmt.Errorf("%s %s: %w", projectID, docKey, database.ErrDocumentNotFound)
+	}
+	if result.Err() != nil {
+		return nil, fmt.Errorf("find retired document of %s: %w", docKey, result.Err())
+	}
+
+	info := &database.DocInfo{}
+	if err := result.Decode(info); err != nil {
+		return nil, fmt.Errorf("find retired document of %s: %w", docKey, err)
+	}
+
+	return info, nil
+}
+
+// UpdateDocInfoStatusToRemoved claims the retirement generation of the
+// document. It is idempotent: removed_at is set only while the document is
+// still alive, so a retry after a lost response keeps the original generation
+// instead of re-stamping it.
 func (c *Client) UpdateDocInfoStatusToRemoved(
 	ctx context.Context,
 	refKey types.DocRefKey,
 ) error {
 	c.docCache.Remove(refKey)
-	result := c.collection(ColDocuments).FindOneAndUpdate(ctx, bson.M{
+	res, err := c.collection(ColDocuments).UpdateOne(ctx, bson.M{
 		"project_id": refKey.ProjectID,
 		"_id":        refKey.DocID,
+		"removed_at": bson.M{"$exists": false},
 	}, bson.M{
 		"$set": bson.M{
 			"removed_at": gotime.Now(),
 		},
-	}, options.FindOneAndUpdate().SetReturnDocument(options.After))
+	})
+	if err != nil {
+		return fmt.Errorf("update %s to removed: %w", refKey, err)
+	}
+	if res.MatchedCount > 0 {
+		return nil
+	}
 
+	// No live document matched: either the generation was already claimed by
+	// a prior call (idempotent success), or the document does not exist at
+	// all.
+	result := c.collection(ColDocuments).FindOne(ctx, bson.M{
+		"project_id": refKey.ProjectID,
+		"_id":        refKey.DocID,
+	})
 	if result.Err() == mongo.ErrNoDocuments {
-		return fmt.Errorf("update %s to removed: %w", refKey, database.ErrDocumentNotFound)
+		return fmt.Errorf("update %s to removed: %w", refKey.DocID, database.ErrDocumentNotFound)
 	}
 	if result.Err() != nil {
 		return fmt.Errorf("update %s to removed: %w", refKey, result.Err())
 	}
 
 	return nil
+}
+
+// MarkDocumentClientsRemoved converges all client rows still attaching or
+// attached to the given document onto its retirement generation.
+func (c *Client) MarkDocumentClientsRemoved(
+	ctx context.Context,
+	docRefKey types.DocRefKey,
+) (int, error) {
+	// Snapshot the affected rows first so their per-node caches can be
+	// dropped afterwards; after the update they no longer answer the
+	// attached query.
+	infos, err := c.FindAttachedClientInfosByRefKey(ctx, docRefKey)
+	if err != nil {
+		return 0, err
+	}
+	attaching, err := c.collection(ColClients).Find(ctx, bson.M{
+		"project_id":     docRefKey.ProjectID,
+		"attaching_docs": docRefKey.DocID,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("find attaching clients of %s: %w", docRefKey, err)
+	}
+	var attachingInfos []*database.ClientInfo
+	if err := attaching.All(ctx, &attachingInfos); err != nil {
+		return 0, fmt.Errorf("decode attaching clients of %s: %w", docRefKey, err)
+	}
+	infos = append(infos, attachingInfos...)
+
+	res, err := c.collection(ColClients).UpdateMany(ctx, bson.M{
+		"project_id": docRefKey.ProjectID,
+		"$or": bson.A{
+			bson.M{"attached_docs": docRefKey.DocID},
+			bson.M{"attaching_docs": docRefKey.DocID},
+		},
+	}, bson.M{
+		"$set": bson.M{
+			clientDocInfoKey(docRefKey.DocID, StatusKey):    database.DocumentRemoved,
+			clientDocInfoKey(docRefKey.DocID, "server_seq"): 0,
+			clientDocInfoKey(docRefKey.DocID, "client_seq"): 0,
+		},
+		"$pull": bson.M{
+			"attached_docs":  docRefKey.DocID,
+			"attaching_docs": docRefKey.DocID,
+		},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("mark clients removed for %s: %w", docRefKey, err)
+	}
+
+	// The bulk write bypassed the locked read-modify-write that normally
+	// refreshes clientCache; drop every stale copy so gates stop reading
+	// "attached" on this node. Other nodes are covered by the retirement
+	// invalidation broadcast.
+	for _, info := range infos {
+		refKey := info.RefKey()
+		unlock := c.lockClientCache(refKey)
+		c.clientCache.Remove(refKey)
+		unlock()
+	}
+
+	return int(res.MatchedCount), nil
+}
+
+// FindPurgeCandidates finds removed documents whose retirement generation is
+// older than retiredBefore, starting after the given ID cursor.
+func (c *Client) FindPurgeCandidates(
+	ctx context.Context,
+	candidatesLimit int,
+	retiredBefore gotime.Time,
+	lastDocID types.ID,
+) ([]*database.DocInfo, types.ID, error) {
+	filter := bson.M{
+		"removed_at": bson.M{"$lte": retiredBefore},
+	}
+	if lastDocID != database.ZeroID {
+		filter["_id"] = bson.M{"$gt": lastDocID}
+	}
+
+	cursor, err := c.collection(ColDocuments).Find(ctx, filter,
+		options.Find().
+			SetSort(bson.D{{Key: "_id", Value: 1}}).
+			SetLimit(int64(candidatesLimit)))
+	if err != nil {
+		return nil, database.ZeroID, fmt.Errorf("find purge candidates: %w", err)
+	}
+
+	var infos []*database.DocInfo
+	if err := cursor.All(ctx, &infos); err != nil {
+		return nil, database.ZeroID, fmt.Errorf("fetch purge candidates: %w", err)
+	}
+
+	var nextID = database.ZeroID
+	if len(infos) > 0 {
+		nextID = infos[len(infos)-1].ID
+	}
+
+	return infos, nextID, nil
 }
 
 // UpdateDocInfoSchema updates the document schema.
@@ -1956,6 +2124,18 @@ func (c *Client) CreateChangeInfos(
 	if err != nil {
 		return nil, change.InitialCheckpoint, err
 	}
+
+	// Retirement fence: once the generation is claimed, no change may be
+	// appended and the document can never be flipped back to alive. A late
+	// PushPull or Detach with no new changes is a no-op success that keeps
+	// the original removed_at; callers still get the removed docInfo back so
+	// their response carries the removed flag.
+	if docInfo.IsRemoved() {
+		if len(changes) > 0 {
+			return nil, change.InitialCheckpoint, fmt.Errorf("create changes of %s: %w", refKey, database.ErrDocumentRetired)
+		}
+		return docInfo, checkpoint, nil
+	}
 	if len(changes) == 0 && !isRemoved {
 		return docInfo, checkpoint, nil
 	}
@@ -2078,6 +2258,13 @@ func (c *Client) CompactChangeInfos(
 	lastServerSeq int64,
 	changes []*change.Change,
 ) error {
+	// A retired generation keeps its changes and snapshot so offline clients
+	// can recognize the deletion until the deferred purge runs. Compaction
+	// would wipe that tombstone history.
+	if docInfo.IsRemoved() {
+		return fmt.Errorf("compact document of %s: %w", docInfo.RefKey(), database.ErrDocumentRetired)
+	}
+
 	newServerSeq := int64(1)
 	if len(changes) == 0 {
 		newServerSeq = 0

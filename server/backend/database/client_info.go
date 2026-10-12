@@ -287,6 +287,29 @@ func (i *ClientInfo) RemoveDocument(docID types.ID) error {
 	return nil
 }
 
+// MarkDocumentRemovedByServer converges this client's copy of a document
+// onto a retirement generation the server has already claimed. Unlike
+// RemoveDocument, which is the client-driven transition and requires an
+// attached or attaching row, this is idempotent across retries and across
+// late requests: attaching and attached rows converge to removed, a detached
+// row converges as well, and an already-removed row is left untouched. A row
+// that never held the document is a no-op, so the bulk convergence can run
+// over clients that merely share the project, including deactivated ones
+// whose rows still reference the document.
+func (i *ClientInfo) MarkDocumentRemovedByServer(docID types.ID) error {
+	clientDocInfo := i.Documents[docID]
+	if clientDocInfo == nil || clientDocInfo.Status == DocumentRemoved {
+		return nil
+	}
+
+	clientDocInfo.Status = DocumentRemoved
+	clientDocInfo.ClientSeq = 0
+	clientDocInfo.ServerSeq = 0
+	i.UpdatedAt = gotime.Now()
+
+	return nil
+}
+
 // IsAttached returns whether the given document is attached to this client.
 func (i *ClientInfo) IsAttached(docID types.ID) (bool, error) {
 	if !i.hasDocument(docID) {

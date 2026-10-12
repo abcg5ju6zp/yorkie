@@ -97,6 +97,12 @@ var (
 
 	// ErrInvalidInviteToken is returned when the invite token is invalid.
 	ErrInvalidInviteToken = errors.InvalidArgument("invalid invite token").WithCode("ErrInvalidInviteToken")
+
+	// ErrDocumentRetired is returned when an operation targets a document
+	// whose retirement generation has already been claimed (removed_at is set)
+	// but not yet purged. New attaches and writes are refused for the retired
+	// generation; clients pulling from it receive its removed flag instead.
+	ErrDocumentRetired = errors.FailedPrecond("document is removed").WithCode("ErrDocumentRemoved")
 )
 
 // Database represents database which reads or saves Yorkie data.
@@ -285,8 +291,37 @@ type Database interface {
 	// FindDocInfoByRefKey finds the document of the given refKey.
 	FindDocInfoByRefKey(ctx context.Context, refKey types.DocRefKey) (*DocInfo, error)
 
-	// UpdateDocInfoStatusToRemoved updates the document status to removed.
+	// UpdateDocInfoStatusToRemoved claims the document's retirement
+	// generation by setting removed_at. It is idempotent: a repeated call on
+	// an already removed document keeps the original generation's removed_at
+	// and succeeds, so a retried removal after a lost response continues the
+	// same generation instead of starting a new one.
 	UpdateDocInfoStatusToRemoved(ctx context.Context, refKey types.DocRefKey) error
+
+	// FindRetiredDocInfoByKey finds the retired (removed but not yet purged)
+	// document generation for the given key. It is the inverse of
+	// FindDocInfoByKey, which only matches live documents: the pair lets a
+	// retried removal by key discover that its generation is still queryable.
+	FindRetiredDocInfoByKey(ctx context.Context, projectID types.ID, docKey key.Key) (*DocInfo, error)
+
+	// MarkDocumentClientsRemoved converges every client row that still holds
+	// the given document in attaching or attached state onto the retirement
+	// generation: the client-document status becomes removed and its
+	// checkpoint is cleared. Detached and already-removed rows are left
+	// untouched. It returns the number of client rows that converged.
+	MarkDocumentClientsRemoved(ctx context.Context, docRefKey types.DocRefKey) (int, error)
+
+	// FindPurgeCandidates finds removed documents whose retirement
+	// generation was claimed (removed_at) at or before retiredBefore,
+	// iterating by document ID from the given cursor. It powers the deferred
+	// purge that runs only after the offline recovery window. A zero cursor
+	// starts from the beginning.
+	FindPurgeCandidates(
+		ctx context.Context,
+		candidatesLimit int,
+		retiredBefore gotime.Time,
+		lastDocID types.ID,
+	) ([]*DocInfo, types.ID, error)
 
 	// UpdateDocInfoSchema updates the document schema.
 	UpdateDocInfoSchema(ctx context.Context, refKey types.DocRefKey, schemaKey string) error
@@ -342,6 +377,8 @@ type Database interface {
 	) ([]*ProjectInfo, types.ID, error)
 
 	// CreateChangeInfos stores the given changes then updates the given docInfo.
+	// It never resurrects a retired generation: changes are refused once
+	// removed_at is set, and a repeated remove is a no-op success.
 	CreateChangeInfos(
 		ctx context.Context,
 		docRefKey types.DocRefKey,

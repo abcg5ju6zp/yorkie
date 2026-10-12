@@ -161,7 +161,13 @@ func Purge(
 		return fmt.Errorf("purge document %s: %w", docInfo.ID, ErrDocumentNotRemoved)
 	}
 
-	// 2. Purge the document from the database.
+	// 2. Release the node-local channel resources before the history goes
+	// away: any Watch still open against this retired generation must end and
+	// reconnect into the removed result rather than observe a vanishing
+	// document. This handler runs on the document's owner node.
+	be.PubSub.CloseDocument(ctx, docInfo.RefKey())
+
+	// 3. Purge the document from the database.
 	counts, err := be.DB.PurgeDocument(ctx, docInfo.RefKey())
 	if err != nil {
 		return err

@@ -27,11 +27,9 @@ import (
 
 	"github.com/yorkie-team/yorkie/api/converter"
 	"github.com/yorkie-team/yorkie/api/types"
-	"github.com/yorkie-team/yorkie/api/types/events"
 	api "github.com/yorkie-team/yorkie/api/yorkie/v1"
 	"github.com/yorkie-team/yorkie/internal/version"
 	pkgchannel "github.com/yorkie-team/yorkie/pkg/channel"
-	"github.com/yorkie-team/yorkie/pkg/document/time"
 	"github.com/yorkie-team/yorkie/pkg/document/yson"
 	"github.com/yorkie-team/yorkie/pkg/errors"
 	"github.com/yorkie-team/yorkie/pkg/key"
@@ -722,37 +720,47 @@ func (s *adminServer) RemoveDocumentByAdmin(
 	req *connect.Request[api.RemoveDocumentByAdminRequest],
 ) (*connect.Response[api.RemoveDocumentByAdminResponse], error) {
 	project := projects.From(ctx)
+	docKey := key.Key(req.Msg.DocumentKey)
 
-	locker := s.backend.Lockers.LockerWithRLock(packs.DocKey(project.ID, key.Key(req.Msg.DocumentKey)))
+	locker := s.backend.Lockers.LockerWithRLock(packs.DocKey(project.ID, docKey))
 	defer locker.RUnlock()
 
-	docInfo, err := documents.FindDocInfoByKey(ctx, s.backend, project, key.Key(req.Msg.DocumentKey))
+	// Look up the live generation first. If none exists, a retired generation
+	// still within the recovery window makes this request an idempotent
+	// retry: it converges the same generation again and succeeds instead of
+	// answering not-found. Only after purge is the name reusable.
+	docInfo, err := documents.FindDocInfoByKey(ctx, s.backend, project, docKey)
 	if err != nil {
-		return nil, err
+		if !stderrors.Is(err, database.ErrDocumentNotFound) {
+			return nil, err
+		}
+
+		retired, retiredErr := documents.FindRetiredDocInfoByKey(ctx, s.backend, project.ID, docKey)
+		if retiredErr != nil {
+			return nil, err
+		}
+
+		if err := documents.ConvergeRetiredDocument(ctx, s.backend, retired); err != nil {
+			return nil, err
+		}
+
+		logging.DefaultLogger().Info(
+			fmt.Sprintf("document remove already retired(projectID: %s, docKey: %s)", project.ID, docKey),
+		)
+		return connect.NewResponse(&api.RemoveDocumentByAdminResponse{}), nil
 	}
 
-	if err := documents.RemoveDocument(
-		ctx, s.backend,
+	if _, err := documents.RetireDocument(
+		ctx,
+		s.backend,
 		docInfo.RefKey(),
 		req.Msg.Force,
 	); err != nil {
 		return nil, err
 	}
 
-	// TODO(emplam27): Change the publisherID to the actual user ID. This is a temporary solution.
-	publisherID := time.InitialActorID
-	s.backend.PubSub.Publish(
-		ctx,
-		publisherID,
-		events.DocEvent{
-			Type:  events.DocChanged,
-			Actor: publisherID,
-			Key:   docInfo.RefKey(),
-		},
-	)
-
 	logging.DefaultLogger().Info(
-		fmt.Sprintf("document remove success(projectID: %s, docKey: %s)", project.ID, req.Msg.DocumentKey),
+		fmt.Sprintf("document remove success(projectID: %s, docKey: %s)", project.ID, docKey),
 	)
 
 	return connect.NewResponse(&api.RemoveDocumentByAdminResponse{}), nil

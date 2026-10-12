@@ -226,9 +226,28 @@ func TestAuthWebhookRemovalByMethod(t *testing.T) {
 		a := activate(t, "writer", k)
 		attach(t, &a, false)
 
-		// Before the fix this detached the client as removed but left the
-		// document in place.
+		// The method (not the pack flag) removes the document: its
+		// generation is retired and the key cannot be re-attached while it is
+		// retained.
 		require.NoError(t, remove(a, false))
+		retired, err := svr.Backend().DB.FindRetiredDocInfoByKey(ctx, project.ID, k)
+		require.NoError(t, err)
+
+		retry := activate(t, "writer", k)
+		retryReq := connect.NewRequest(&api.AttachDocumentRequest{
+			ClientId: retry.clientID,
+			ChangePack: &api.ChangePack{
+				DocumentKey: k.String(), Checkpoint: &api.Checkpoint{},
+			},
+		})
+		withHeaders(retryReq, "writer", k)
+		_, err = raw.AttachDocument(ctx, retryReq)
+		assert.Equal(t, connect.CodeFailedPrecondition, connect.CodeOf(err))
+
+		// Once the generation is purged, a same-key attach gets a fresh
+		// document.
+		_, err = svr.Backend().DB.PurgeDocument(ctx, retired.RefKey())
+		require.NoError(t, err)
 		assert.Equal(t, `{}`, contentOf(t, k))
 	})
 }

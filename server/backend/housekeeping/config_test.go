@@ -71,4 +71,33 @@ func TestConfig(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "parse interval")
 	})
+
+	t.Run("retirement retention interval test", func(t *testing.T) {
+		base := housekeeping.Config{Interval: "1m", CandidatesLimit: 100, CompactionMinChanges: 100}
+
+		conf := base
+		conf.RetirementRetentionInterval = "24h"
+		assert.NoError(t, conf.Validate())
+		d, err := conf.ParseRetirementRetentionInterval()
+		assert.NoError(t, err)
+		assert.Equal(t, "24h0m0s", d.String())
+
+		// Empty and explicit zero disable the deferred purge task.
+		empty := base
+		assert.NoError(t, empty.Validate())
+		d, err = empty.ParseRetirementRetentionInterval()
+		assert.NoError(t, err)
+		assert.Zero(t, d)
+
+		zero := base
+		zero.RetirementRetentionInterval = "0s"
+		assert.NoError(t, zero.Validate())
+		d, err = zero.ParseRetirementRetentionInterval()
+		assert.NoError(t, err)
+		assert.Zero(t, d)
+
+		bad := base
+		bad.RetirementRetentionInterval = "soon"
+		assert.Error(t, bad.Validate())
+	})
 }

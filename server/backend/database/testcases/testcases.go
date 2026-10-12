@@ -1864,8 +1864,21 @@ func RunCreateChangeInfosTest(t *testing.T, db database.Database, projectID type
 		_, _, err := db.CreateChangeInfos(ctx, docInfo1.RefKey(), change.InitialCheckpoint, []*database.ChangeInfo{}, true)
 		assert.NoError(t, err)
 
-		// 03. Create a document with same key and check they have same key but different id.
-		docInfo2, _ := db.FindOrCreateDocInfo(ctx, clientInfo1.RefKey(), docKey, false)
+		// 03. While the retired generation is retained, creating a document
+		// with the same key is refused instead of silently starting a new
+		// generation that late pushes or a purge could confuse with the
+		// retired one.
+		docInfo2, err := db.FindOrCreateDocInfo(ctx, clientInfo1.RefKey(), docKey, false)
+		assert.ErrorIs(t, err, database.ErrDocumentRetired)
+		assert.Nil(t, docInfo2)
+
+		// 04. After the retired generation is purged, the key is reusable and
+		// the new document has the same key but a different id.
+		_, err = db.PurgeDocument(ctx, docRefKey1)
+		assert.NoError(t, err)
+
+		docInfo2, err = db.FindOrCreateDocInfo(ctx, clientInfo1.RefKey(), docKey, false)
+		assert.NoError(t, err)
 		docRefKey2 := docInfo2.RefKey()
 		assert.NoError(t, clientInfo1.AttachDocument(docRefKey2.DocID, false, docInfo2.Epoch, 0, change.InitialCheckpoint))
 		assert.NoError(t, db.UpdateClientInfoAfterPushPull(ctx, clientInfo1, docInfo2))
@@ -2488,6 +2501,114 @@ func RunPurgeDocument(t *testing.T, db database.Database, projectID types.ID) {
 		assert.Equal(t, int64(0), counts["snapshots"])
 		assert.Equal(t, int64(0), counts["versionVectors"])
 	})
+}
+
+// RunRetirementGenerationTest verifies the database primitives of a
+// queryable retirement generation: an idempotent removed transition, lookup
+// by key of the retired generation, bulk client convergence, the
+// no-resurrect write fence, and the purge-candidate recovery window.
+func RunRetirementGenerationTest(t *testing.T, db database.Database, projectID types.ID) {
+	ctx := context.Background()
+	docKey := key.Key(fmt.Sprintf("tests$%s", t.Name()))
+
+	// 01. Two clients attach the document.
+	owner, _ := db.ActivateClient(ctx, projectID, t.Name()+"-owner", nil)
+	peer, _ := db.ActivateClient(ctx, projectID, t.Name()+"-peer", nil)
+	docInfo, _ := db.FindOrCreateDocInfo(ctx, owner.RefKey(), docKey, false)
+	refKey := docInfo.RefKey()
+	assert.NoError(t, owner.AttachDocument(refKey.DocID, false, docInfo.Epoch, 0, change.InitialCheckpoint))
+	assert.NoError(t, peer.AttachDocument(refKey.DocID, false, docInfo.Epoch, 0, change.InitialCheckpoint))
+	assert.NoError(t, db.UpdateClientInfoAfterPushPull(ctx, owner, docInfo))
+	assert.NoError(t, db.UpdateClientInfoAfterPushPull(ctx, peer, docInfo))
+
+	// 02. Claim the generation; a repeat keeps the original removed_at.
+	assert.NoError(t, db.UpdateDocInfoStatusToRemoved(ctx, refKey))
+	claimed, err := db.FindDocInfoByRefKey(ctx, refKey)
+	assert.NoError(t, err)
+	assert.False(t, claimed.RemovedAt.IsZero())
+	removedAt := claimed.RemovedAt
+
+	assert.NoError(t, db.UpdateDocInfoStatusToRemoved(ctx, refKey))
+	again, err := db.FindDocInfoByRefKey(ctx, refKey)
+	assert.NoError(t, err)
+	assert.Equal(t, removedAt, again.RemovedAt)
+
+	// 03. The retired generation is queryable by key while a live lookup hides
+	// it.
+	retired, err := db.FindRetiredDocInfoByKey(ctx, projectID, docKey)
+	assert.NoError(t, err)
+	assert.Equal(t, docInfo.ID, retired.ID)
+	_, err = db.FindDocInfoByKey(ctx, projectID, docKey)
+	assert.ErrorIs(t, err, database.ErrDocumentNotFound)
+
+	// 04. Bulk convergence moves both attachments onto the generation and is
+	// idempotent.
+	converged, err := db.MarkDocumentClientsRemoved(ctx, refKey)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, converged)
+	owner, _ = db.FindClientInfoByRefKey(ctx, owner.RefKey())
+	peer, _ = db.FindClientInfoByRefKey(ctx, peer.RefKey())
+	assert.Equal(t, database.DocumentRemoved, owner.Documents[refKey.DocID].Status)
+	assert.Equal(t, database.DocumentRemoved, peer.Documents[refKey.DocID].Status)
+
+	attached, err := db.IsDocumentAttachedOrAttaching(ctx, refKey, "")
+	assert.NoError(t, err)
+	assert.False(t, attached)
+
+	converged, err = db.MarkDocumentClientsRemoved(ctx, refKey)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, converged)
+
+	// 05. A write cannot enter or resurrect the generation, but a repeated
+	// remove is a no-op success.
+	bytesID, _ := owner.ID.Bytes()
+	actorID, _ := time.ActorIDFromBytes(bytesID)
+	doc := document.New(docKey)
+	doc.SetActor(actorID)
+	assert.NoError(t, doc.Update(func(root *json.Object, p *presence.Presence) error {
+		root.SetNewArray("late")
+		return nil
+	}))
+	pack := doc.CreateChangePack()
+	_, _, err = db.CreateChangeInfos(
+		ctx, refKey, change.InitialCheckpoint,
+		toChangeInfos(t, refKey, pack.Changes), false,
+	)
+	assert.ErrorIs(t, err, database.ErrDocumentRetired)
+
+	noop, _, err := db.CreateChangeInfos(ctx, refKey, change.InitialCheckpoint, nil, true)
+	assert.NoError(t, err)
+	assert.True(t, noop.IsRemoved())
+	assert.Equal(t, docInfo.ServerSeq, noop.ServerSeq, "retired generation must be frozen")
+
+	// 06. The generation is a purge candidate only after the window cutoff.
+	before, nextID, err := db.FindPurgeCandidates(ctx, 100, gotime.Unix(0, 0), database.ZeroID)
+	assert.NoError(t, err)
+	for _, info := range before {
+		assert.NotEqual(t, docInfo.ID, info.ID)
+	}
+	_ = nextID
+
+	after, _, err := db.FindPurgeCandidates(ctx, 100, gotime.Now(), database.ZeroID)
+	assert.NoError(t, err)
+	found := false
+	for _, info := range after {
+		if info.ID == docInfo.ID {
+			found = true
+		}
+	}
+	assert.True(t, found, "a retired generation past the cutoff must be a purge candidate")
+
+	// 07. After purge the retired lookup loses it and the key is reusable.
+	_, err = db.PurgeDocument(ctx, refKey)
+	assert.NoError(t, err)
+	_, err = db.FindRetiredDocInfoByKey(ctx, projectID, docKey)
+	assert.ErrorIs(t, err, database.ErrDocumentNotFound)
+
+	reborn, err := db.FindOrCreateDocInfo(ctx, owner.RefKey(), docKey, false)
+	assert.NoError(t, err)
+	assert.NotEqual(t, docInfo.ID, reborn.ID)
+	assert.False(t, reborn.IsRemoved())
 }
 
 // AssertKeys checks the equivalence between the provided expectedKeys and the keys in the given infos.

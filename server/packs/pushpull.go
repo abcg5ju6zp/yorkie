@@ -112,17 +112,20 @@ func PushPull(
 	start := gotime.Now()
 	hostname := be.Config.Hostname
 
-	// 00. Validate ClientSeq continuity against the original request.
-	// Presence stripping must not run first: presence-only changes also
-	// occupy ClientSeq, and dropping them early would hide gaps.
-	if err := validateClientSeqContinuity(clientInfo.Checkpoint(docKey.DocID), reqPack); err != nil {
-		be.Metrics.AddPushPullErrors(hostname, project, 1)
-		return nil, err
-	}
+	// 00. Validate change actors against the original request. ClientSeq
+	// continuity is validated inside pushPack once the document state is
+	// loaded, because a retired generation discards the push and must accept
+	// a client whose checkpoint the server reset during convergence.
 	if err := validateChangeActors(ctx, clientInfo, clientInfo.Checkpoint(docKey.DocID), docKey, reqPack); err != nil {
 		be.Metrics.AddPushPullErrors(hostname, project, 1)
 		return nil, err
 	}
+
+	// Snapshot the pack as sent: clientSeq continuity is validated against it
+	// inside pushPack, after presence stripping and folding would otherwise
+	// hide gaps occupied by presence-only changes. Stripping reuses the
+	// slice's backing array, so copy the entries.
+	rawChanges := append([]*change.Change(nil), reqPack.Changes...)
 
 	// 01. Strip presence on the way in when the document opted out. Doing
 	// this before pushPack means no presence-only change ever reaches the
@@ -153,7 +156,7 @@ func PushPull(
 		maxSize = 0
 	}
 	pushedChanges, docInfo, initialSeq, cpAfterPush, err := pushPack(
-		ctx, be, clientInfo, docKey, reqPack, maxSize, statusChange,
+		ctx, be, clientInfo, docKey, reqPack, rawChanges, maxSize, statusChange,
 	)
 	if err != nil {
 		be.Metrics.AddPushPullErrors(hostname, project, 1)
@@ -261,10 +264,11 @@ func PushPull(
 	return resPack, nil
 }
 
-func validateClientSeqContinuity(cpBeforePush change.Checkpoint, reqPack *change.Pack) error {
-	// The clientSeq of the changes in the request pack must be continuous.
+func validateClientSeqContinuity(cpBeforePush change.Checkpoint, changes []*change.Change) error {
+	// The clientSeq of the given changes must be continuous from the
+	// checkpoint.
 	expectedClientSeq := cpBeforePush.ClientSeq + 1
-	for _, cn := range reqPack.Changes {
+	for _, cn := range changes {
 		if cn.ID().ClientSeq() <= cpBeforePush.ClientSeq {
 			continue
 		}
@@ -360,6 +364,7 @@ func pushPack(
 	clientInfo *database.ClientInfo,
 	docKey types.DocRefKey,
 	reqPack *change.Pack,
+	rawChanges []*change.Change,
 	maxSize int,
 	statusChange bool,
 ) ([]*database.ChangeInfo, *database.DocInfo, int64, change.Checkpoint, error) {
@@ -393,7 +398,7 @@ func pushPack(
 	// cache entry, causing ErrConflictOnUpdate in CreateChangeInfos.
 	// ServerSeq validation also belongs here so it observes the same locked
 	// DocInfo snapshot and never runs ahead of epoch mismatch handling.
-	if len(pushables) > 0 || reqPack.IsRemoved {
+	if len(rawChanges) > 0 || reqPack.IsRemoved {
 		locker := be.Lockers.Locker(DocPushKey(docKey))
 		defer locker.Unlock()
 
@@ -402,28 +407,53 @@ func pushPack(
 			return nil, nil, time.InitialLamport, change.InitialCheckpoint, err
 		}
 
-		clientDocInfo := clientInfo.Documents[docKey.DocID]
-		epochMismatch := clientDocInfo != nil && clientDocInfo.Epoch != currentDocInfo.Epoch
-		if epochMismatch {
-			// 03. Discard stale-epoch changes before storing them.
-			// pushPack runs before preparePack. Without this check, stale-epoch
-			// changes would be inserted into the in-memory changeCache, polluting
-			// it with operations that reference pre-compaction CRDT node IDs.
-			// preparePack will return ErrEpochMismatch to the client downstream.
+		if currentDocInfo.IsRemoved() {
+			// 03. Retirement fence: the generation is already claimed, so no
+			// late push may extend it. ClientSeq continuity is not required —
+			// the server's convergence may have reset the client's checkpoint
+			// while it was offline — and the changes are dropped here rather
+			// than rejected outright so the pull below still runs and the
+			// response carries the removed flag, letting the late client
+			// converge onto the deletion instead of retrying forever.
 			if len(pushables) > 0 {
 				logging.From(ctx).Warnf(
-					"discarding %d changes from stale epoch: client(%d) != doc(%d)",
-					len(pushables),
-					clientDocInfo.Epoch,
-					currentDocInfo.Epoch,
+					"discarding %d late changes into retired document %s",
+					len(pushables), docKey.DocID,
 				)
 				pushables = nil
 			}
-		} else if reqPack.Checkpoint.ServerSeq > currentDocInfo.ServerSeq {
-			return nil, nil, time.InitialLamport, change.InitialCheckpoint, connect.NewError(
-				connect.CodeInvalidArgument,
-				errors.InvalidArgument("checkpoint serverSeq exceeds server state").WithCode("ErrInvalidServerSeq"),
-			)
+		} else {
+			// Validate ClientSeq continuity against the pack as sent and the
+			// locked document snapshot. Presence stripping and folding must
+			// not be observed here: presence-only changes also occupy
+			// ClientSeq, and dropping them first would hide gaps.
+			if err := validateClientSeqContinuity(cpBeforePush, rawChanges); err != nil {
+				return nil, nil, time.InitialLamport, change.InitialCheckpoint, err
+			}
+
+			clientDocInfo := clientInfo.Documents[docKey.DocID]
+			if clientDocInfo != nil && clientDocInfo.Epoch != currentDocInfo.Epoch {
+				// Discard stale-epoch changes before storing them. pushPack
+				// runs before preparePack. Without this check, stale-epoch
+				// changes would be inserted into the in-memory changeCache,
+				// polluting it with operations that reference pre-compaction
+				// CRDT node IDs. preparePack returns ErrEpochMismatch to the
+				// client downstream.
+				if len(pushables) > 0 {
+					logging.From(ctx).Warnf(
+						"discarding %d changes from stale epoch: client(%d) != doc(%d)",
+						len(pushables),
+						clientDocInfo.Epoch,
+						currentDocInfo.Epoch,
+					)
+					pushables = nil
+				}
+			} else if reqPack.Checkpoint.ServerSeq > currentDocInfo.ServerSeq {
+				return nil, nil, time.InitialLamport, change.InitialCheckpoint, connect.NewError(
+					connect.CodeInvalidArgument,
+					errors.InvalidArgument("checkpoint serverSeq exceeds server state").WithCode("ErrInvalidServerSeq"),
+				)
+			}
 		}
 
 		// 04. Enforce MaxSizePerDocument. A detach or remove still goes
@@ -451,7 +481,21 @@ func pushPack(
 		reqPack.IsRemoved,
 	)
 	if err != nil {
-		return nil, nil, time.InitialLamport, change.InitialCheckpoint, err
+		// The generation was claimed between the locked read above and the
+		// write (or the pack is a late push the locked snapshot did not yet
+		// show as retired). Drop the changes onto the retired generation and
+		// re-read it so the pull below still returns the removed flag instead
+		// of failing: a push that raced a removal must converge, not retry.
+		if stderrors.Is(err, database.ErrDocumentRetired) {
+			pushables = nil
+			docInfo, err = be.DB.FindDocInfoByRefKey(ctx, docKey)
+			if err != nil {
+				return nil, nil, time.InitialLamport, change.InitialCheckpoint, err
+			}
+			cpAfterPush = cpBeforePush
+		} else {
+			return nil, nil, time.InitialLamport, change.InitialCheckpoint, err
+		}
 	}
 
 	initialSeq := docInfo.ServerSeq - int64(len(pushables))
@@ -493,7 +537,11 @@ func pullPack(
 		// skip the pull and return an empty pack to let the detach proceed.
 		isDetachOrRemove := opts.Status == document.StatusDetached ||
 			opts.Status == document.StatusRemoved
-		if stderrors.Is(err, ErrEpochMismatch) && isDetachOrRemove {
+		// A retired generation also takes the empty-pack path on an epoch
+		// mismatch: its history is frozen, and a late stale-epoch client only
+		// needs the removed flag to converge — it must not be sent back into
+		// an attach re-anchor the generation now refuses.
+		if stderrors.Is(err, ErrEpochMismatch) && (isDetachOrRemove || docInfo.IsRemoved()) {
 			resPack = NewServerPack(docInfo.Key, change.Checkpoint{
 				ServerSeq: reqPack.Checkpoint.ServerSeq,
 				ClientSeq: cpAfterPush.ClientSeq,
@@ -504,8 +552,16 @@ func pullPack(
 	}
 	resPack.ApplyDocInfo(docInfo)
 
-	// 02. update the document's status in the client.
-	if err := clientInfo.UpdateDocStatus(docInfo.ID, opts.Status, resPack.Checkpoint); err != nil {
+	// 02. update the document's status in the client. A retired generation
+	// converges every client that reaches it to removed, regardless of the
+	// status the request asked for: a late PushPull, Detach or deactivation
+	// fan-out must finish on the removed result, and the transition is
+	// idempotent so retries and already-removed rows do not fail.
+	if docInfo.IsRemoved() {
+		if err := clientInfo.MarkDocumentRemovedByServer(docInfo.ID); err != nil {
+			return nil, err
+		}
+	} else if err := clientInfo.UpdateDocStatus(docInfo.ID, opts.Status, resPack.Checkpoint); err != nil {
 		return nil, err
 	}
 
@@ -515,6 +571,10 @@ func pullPack(
 	// tombstone GC, and excluding it from minVV is correct because
 	// tombstones do not need to be kept alive for this client. See
 	// docs/design/disable-gc-on-attach.md.
+	//
+	// A retired generation is frozen for the recovery window and purged
+	// wholesale afterwards, so no minVV tracking runs against it: late
+	// clients must not extend its version-vector rows.
 	if opts.DisableGC {
 		if resPack.SnapshotLen() > 0 {
 			// Snapshot pulls must still carry the doc's max lamport so the
@@ -539,6 +599,13 @@ func pullPack(
 			// Change pulls do not need a pack-level lamport hint: each
 			// Change.ID carries its own lamport that the client uses
 			// directly via SyncLamport.
+			resPack.VersionVector = nil
+		}
+	} else if docInfo.IsRemoved() {
+		// Frozen generation: a change pull carries no minVV response; a
+		// snapshot pull keeps the snapshot's vector so the client's clock
+		// catches up before it applies the removed flag.
+		if resPack.SnapshotLen() == 0 {
 			resPack.VersionVector = nil
 		}
 	} else {

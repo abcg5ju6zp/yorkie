@@ -363,6 +363,24 @@ func (b *Backend) BroadcastCacheInvalidation(
 	return nil
 }
 
+// BroadcastDocumentRetirement asks every cluster node to drop its node-local
+// state for a document's retirement generation: Watch streams for the
+// document end (so they reconnect into the removed result), and the document
+// and snapshot caches drop the generation. The invalidation key is the
+// DocRefKey (DocID), which uniquely identifies the generation, so the
+// broadcast can never reach a same-key document created after this one was
+// purged. Failure is returned to the caller, which logs it: the retirement
+// itself is durable and retries converge the nodes that missed it.
+func (b *Backend) BroadcastDocumentRetirement(
+	ctx context.Context,
+	docRefKey types.DocRefKey,
+) error {
+	if err := b.BroadcastCacheInvalidation(ctx, types.CacheTypeDocument, docRefKey.CacheKey()); err != nil {
+		return fmt.Errorf("broadcast document retirement: %w", err)
+	}
+	return nil
+}
+
 // BroadcastRevalidateAccess asks every cluster node to verify again the
 // project's Watch streams for the given keys. It goes to every node rather
 // than to the shard owner, because a stream opened before a rebalance stays
@@ -520,6 +538,13 @@ func (b *Backend) BroadcastChannelCount(
 
 // prepareClusterClients returns cluster nodes and prunes inactive clients.
 func (b *Backend) prepareClusterClients(ctx context.Context) ([]*database.ClusterNodeInfo, error) {
+	// An embedded backend without membership (in-process use and tests) has
+	// no peer nodes to fan out to; callers handle node-local state
+	// themselves.
+	if b.Membership == nil {
+		return nil, nil
+	}
+
 	nodes, err := b.Membership.ClusterNodes(ctx)
 	if err != nil {
 		return nil, err

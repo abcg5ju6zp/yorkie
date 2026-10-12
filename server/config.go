@@ -50,6 +50,10 @@ const (
 	DefaultHousekeepingDeactivateConcurrency = 8
 	DefaultHousekeepingCompactionMinChanges  = 1000
 	DefaultProjectStatsRefreshInterval       = 5 * time.Minute
+	// DefaultRetirementRetentionInterval is the default recovery window a
+	// removed document generation retains its last sequence, snapshot and
+	// version vector before the deferred purge.
+	DefaultRetirementRetentionInterval = 24 * time.Hour
 
 	DefaultMongoConnectionURI                = "mongodb://localhost:27017"
 	DefaultMongoConnectionTimeout            = 5 * time.Second
@@ -272,6 +276,9 @@ func (c *Config) ensureHouseKeepingDefaultValue() {
 	if c.Housekeeping.ProjectStatsRefreshInterval == "" {
 		c.Housekeeping.ProjectStatsRefreshInterval = DefaultProjectStatsRefreshInterval.String()
 	}
+	if c.Housekeeping.RetirementRetentionInterval == "" {
+		c.Housekeeping.RetirementRetentionInterval = DefaultRetirementRetentionInterval.String()
+	}
 }
 
 // ensureBackendDefaultValue set the default backend.Config value
@@ -446,6 +453,7 @@ func newConfig(port int, profilingPort int) *Config {
 			DeactivateConcurrency:       DefaultHousekeepingDeactivateConcurrency,
 			CompactionMinChanges:        DefaultHousekeepingCompactionMinChanges,
 			ProjectStatsRefreshInterval: DefaultProjectStatsRefreshInterval.String(),
+			RetirementRetentionInterval: DefaultRetirementRetentionInterval.String(),
 		},
 		Backend: &backend.Config{
 			UseDefaultProject: DefaultUseDefaultProject,

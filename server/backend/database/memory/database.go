@@ -1295,6 +1295,13 @@ func (d *DB) FindCompactionCandidates(
 	for raw := iter.Next(); raw != nil; raw = iter.Next() {
 		info := raw.(*database.DocInfo)
 
+		// Retired generations retain their history for offline deletion
+		// recognition and are purged wholesale later; compaction never runs
+		// on them.
+		if info.IsRemoved() {
+			continue
+		}
+
 		// Check if document has enough changes to compact
 		if info.ServerSeq < int64(compactionMinChanges) {
 			continue
@@ -1425,6 +1432,18 @@ func (d *DB) FindOrCreateDocInfo(
 	}
 
 	if info == nil {
+		// A retired (removed, not yet purged) generation still owns the key
+		// for the duration of the recovery window. Refuse to create a
+		// same-key document instead of silently starting a new generation
+		// that late pushes and purges could confuse with the old one.
+		retired, err := d.findRetiredDocInfoByKey(txn, clientRefKey.ProjectID, docKey)
+		if err != nil {
+			return nil, err
+		}
+		if retired != nil {
+			return nil, fmt.Errorf("find or create document of %s: %w", docKey, database.ErrDocumentRetired)
+		}
+
 		now := gotime.Now()
 		info = &database.DocInfo{
 			ID:              newID(),
@@ -1447,6 +1466,28 @@ func (d *DB) FindOrCreateDocInfo(
 	return info.DeepCopy(), nil
 }
 
+// findRetiredDocInfoByKey finds the removed, not yet purged document
+// generation of the given key under the given transaction.
+func (d *DB) findRetiredDocInfoByKey(txn *memdb.Txn, projectID types.ID, docKey key.Key) (*database.DocInfo, error) {
+	iter, err := txn.Get(
+		tblDocuments,
+		"project_id_key",
+		projectID.String(),
+		docKey.String(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find retired document of %s: %w", docKey, err)
+	}
+	var retired *database.DocInfo
+	for val := iter.Next(); val != nil; val = iter.Next() {
+		if info := val.(*database.DocInfo); !info.RemovedAt.IsZero() {
+			retired = info
+		}
+	}
+
+	return retired, nil
+}
+
 // findDocInfoByKey finds the document of the given key.
 func (d *DB) findDocInfoByKey(txn *memdb.Txn, projectID types.ID, docKey key.Key) (*database.DocInfo, error) {
 	// TODO(hackerwins): Removed documents should be filtered out by the query, but
@@ -1461,27 +1502,6 @@ func (d *DB) findDocInfoByKey(txn *memdb.Txn, projectID types.ID, docKey key.Key
 	)
 	if err != nil {
 		return nil, fmt.Errorf("find document of %s: %w", docKey, err)
-	}
-	var docInfo *database.DocInfo
-	for val := iter.Next(); val != nil; val = iter.Next() {
-		if info := val.(*database.DocInfo); info.RemovedAt.IsZero() {
-			docInfo = info
-		}
-	}
-
-	return docInfo, nil
-}
-
-// findDocInfoByID finds the document of the given id.
-func (d *DB) findDocInfoByID(txn *memdb.Txn, projectID types.ID, docID types.ID) (*database.DocInfo, error) {
-	iter, err := txn.Get(
-		tblDocuments,
-		"project_id_id",
-		projectID.String(),
-		docID.String(),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("find document of %s: %w", docID, err)
 	}
 	var docInfo *database.DocInfo
 	for val := iter.Next(); val != nil; val = iter.Next() {
@@ -1549,15 +1569,18 @@ func (d *DB) FindDocInfosByIDs(
 
 	var infos []*database.DocInfo
 	for _, id := range docIDs {
-		info, err := d.findDocInfoByID(txn, projectID, id)
+		// Look up by ID regardless of removed state: a deactivation fan-out
+		// must detach (and converge) rows attached to retired generations,
+		// matching the Mongo implementation which does not filter removed_at.
+		raw, err := txn.First(tblDocuments, "project_id_id", projectID.String(), id.String())
 		if err != nil {
 			return nil, fmt.Errorf("find documents of %v: %w", docIDs, err)
 		}
-		if info == nil {
+		if raw == nil {
 			continue
 		}
 
-		infos = append(infos, info.DeepCopy())
+		infos = append(infos, raw.(*database.DocInfo).DeepCopy())
 	}
 
 	return infos, nil
@@ -1588,7 +1611,30 @@ func (d *DB) FindDocInfoByRefKey(
 	return docInfo.DeepCopy(), nil
 }
 
-// UpdateDocInfoStatusToRemoved updates the status of the document to removed.
+// FindRetiredDocInfoByKey finds the retired (removed, not yet purged)
+// document generation of the given key.
+func (d *DB) FindRetiredDocInfoByKey(
+	_ context.Context,
+	projectID types.ID,
+	docKey key.Key,
+) (*database.DocInfo, error) {
+	txn := d.db.Txn(false)
+	defer txn.Abort()
+
+	info, err := d.findRetiredDocInfoByKey(txn, projectID, docKey)
+	if err != nil {
+		return nil, err
+	}
+	if info == nil {
+		return nil, fmt.Errorf("%s: %w", docKey, database.ErrDocumentNotFound)
+	}
+
+	return info.DeepCopy(), nil
+}
+
+// UpdateDocInfoStatusToRemoved claims the retirement generation of the
+// document. It is idempotent: removed_at is set only on the first call, so a
+// retry after a lost response keeps the original generation.
 func (d *DB) UpdateDocInfoStatusToRemoved(
 	_ context.Context,
 	refKey types.DocRefKey,
@@ -1610,6 +1656,11 @@ func (d *DB) UpdateDocInfoStatusToRemoved(
 		return fmt.Errorf("update %s to removed: %w", refKey.DocID, database.ErrDocumentNotFound)
 	}
 
+	// Continue the existing generation on retry instead of re-stamping it.
+	if !docInfo.RemovedAt.IsZero() {
+		return nil
+	}
+
 	docInfo.RemovedAt = gotime.Now()
 
 	if err := txn.Delete(tblDocuments, docInfo); err != nil {
@@ -1622,6 +1673,88 @@ func (d *DB) UpdateDocInfoStatusToRemoved(
 	txn.Commit()
 
 	return nil
+}
+
+// MarkDocumentClientsRemoved converges all client rows still attaching or
+// attached to the given document onto its retirement generation.
+func (d *DB) MarkDocumentClientsRemoved(
+	_ context.Context,
+	docRefKey types.DocRefKey,
+) (int, error) {
+	txn := d.db.Txn(true)
+	defer txn.Abort()
+
+	it, err := txn.Get(tblClients, "project_id", docRefKey.ProjectID.String())
+	if err != nil {
+		return 0, fmt.Errorf("mark clients removed for %s: %w", docRefKey, err)
+	}
+
+	converged := 0
+	for raw := it.Next(); raw != nil; raw = it.Next() {
+		clientInfo := raw.(*database.ClientInfo)
+		clientDocInfo := clientInfo.Documents[docRefKey.DocID]
+		if clientDocInfo == nil {
+			continue
+		}
+		if clientDocInfo.Status != database.DocumentAttached &&
+			clientDocInfo.Status != database.DocumentAttaching {
+			continue
+		}
+
+		if err := clientInfo.MarkDocumentRemovedByServer(docRefKey.DocID); err != nil {
+			return 0, fmt.Errorf("mark clients removed for %s: %w", docRefKey, err)
+		}
+		if err := txn.Delete(tblClients, clientInfo); err != nil {
+			return 0, fmt.Errorf("mark clients removed for %s: %w", docRefKey, err)
+		}
+		if err := txn.Insert(tblClients, clientInfo); err != nil {
+			return 0, fmt.Errorf("mark clients removed for %s: %w", docRefKey, err)
+		}
+		converged++
+	}
+
+	txn.Commit()
+	return converged, nil
+}
+
+// FindPurgeCandidates finds removed documents whose retirement generation is
+// older than retiredBefore, starting after the given ID cursor.
+func (d *DB) FindPurgeCandidates(
+	_ context.Context,
+	candidatesLimit int,
+	retiredBefore gotime.Time,
+	lastDocID types.ID,
+) ([]*database.DocInfo, types.ID, error) {
+	txn := d.db.Txn(false)
+	defer txn.Abort()
+
+	iter, err := txn.Get(tblDocuments, "id")
+	if err != nil {
+		return nil, database.ZeroID, fmt.Errorf("find purge candidates: %w", err)
+	}
+
+	var candidates []*database.DocInfo
+	for raw := iter.Next(); raw != nil; raw = iter.Next() {
+		info := raw.(*database.DocInfo)
+		if info.RemovedAt.IsZero() || info.RemovedAt.After(retiredBefore) {
+			continue
+		}
+		if info.ID <= lastDocID {
+			continue
+		}
+
+		candidates = append(candidates, info.DeepCopy())
+		if len(candidates) >= candidatesLimit {
+			break
+		}
+	}
+
+	var nextID = database.ZeroID
+	if len(candidates) > 0 {
+		nextID = candidates[len(candidates)-1].ID
+	}
+
+	return candidates, nextID, nil
 }
 
 // UpdateDocInfoSchema updates the document schema.
@@ -1819,6 +1952,17 @@ func (d *DB) CreateChangeInfos(
 	if docInfo.ProjectID != refKey.ProjectID {
 		return nil, change.InitialCheckpoint, fmt.Errorf("create changes of %s: %w", refKey, database.ErrDocumentNotFound)
 	}
+
+	// Retirement fence: once the generation is claimed, no change may be
+	// appended (a late PushPull must not extend a removed document) and the
+	// document can never be flipped back to alive. A repeated remove with no
+	// changes is a no-op success that keeps the original removed_at.
+	if !docInfo.RemovedAt.IsZero() {
+		if len(changes) > 0 {
+			return nil, change.InitialCheckpoint, fmt.Errorf("create changes of %s: %w", refKey, database.ErrDocumentRetired)
+		}
+		return docInfo, checkpoint, nil
+	}
 	initialServerSeq := docInfo.ServerSeq
 
 	for _, cn := range changes {
@@ -1896,12 +2040,19 @@ func (d *DB) CompactChangeInfos(
 	txn := d.db.Txn(true)
 	defer txn.Abort()
 
-	// 1. Purge the resources of the document.
+	// 1. A retired generation keeps its changes and snapshot for offline
+	// clients until the deferred purge; compaction would wipe the tombstone
+	// history they need to recognize the deletion.
+	if docInfo.IsRemoved() {
+		return fmt.Errorf("compact document of %s: %w", docInfo.RefKey(), database.ErrDocumentRetired)
+	}
+
+	// 2. Purge the resources of the document.
 	if _, err := d.purgeDocumentInternals(ctx, docInfo.ProjectID, docInfo.ID, txn); err != nil {
 		return err
 	}
 
-	// 2. Store compacted change and update document
+	// 3. Store compacted change and update document
 	raw, err := txn.First(
 		tblDocuments,
 		"project_id_id",
@@ -1950,7 +2101,7 @@ func (d *DB) CompactChangeInfos(
 		}
 	}
 
-	// 3. Update document
+	// 4. Update document
 	now := gotime.Now()
 	loadedDocInfo.Epoch++
 	loadedDocInfo.CompactedAt = now

@@ -433,6 +433,69 @@ func (r *Yorkie) RegisterHousekeepingTasks(be *backend.Backend) error {
 		return err
 	}
 
+	// Retirement finalize: after the recovery window, purge generations that
+	// have drained their attachments and Watches, releasing changes,
+	// snapshots, version vectors and the document row last.
+	retentionInterval, err := be.Housekeeping.Config.ParseRetirementRetentionInterval()
+	if err != nil {
+		return err
+	}
+	if retentionInterval > 0 {
+		retirementState := &housekeepingState{lastID: database.ZeroID}
+
+		logging.DefaultLogger().Infof(
+			"HSKP: retirement finalize registered — interval=%s candidates_limit=%d retention=%s",
+			interval, be.Housekeeping.Config.CandidatesLimit, retentionInterval,
+		)
+
+		if err := be.Housekeeping.RegisterTask(interval, func(ctx context.Context) error {
+			retirementState.Lock()
+			currentLastID := retirementState.lastID
+			retirementState.Unlock()
+
+			isNewTerm := currentLastID == database.ZeroID
+			start := time.Now()
+			cutoff := time.Now().Add(-retentionInterval)
+
+			lastID, candidatesCount, purgedCount, err := documents.FinalizeRetiredDocuments(
+				ctx,
+				be,
+				be.Housekeeping.Config.CandidatesLimit,
+				cutoff,
+				currentLastID,
+			)
+			if err != nil {
+				return err
+			}
+
+			retirementState.Lock()
+			if isNewTerm {
+				retirementState.term++
+			}
+			retirementState.lastID = lastID
+			retirementState.totalCandidates += candidatesCount
+			retirementState.totalProcessed += purgedCount
+
+			if purgedCount > 0 {
+				logging.From(ctx).Infof(
+					"HSKP: retirement #%d %s candidates %d/%d purged %d/%d %s",
+					retirementState.term,
+					currentLastID,
+					candidatesCount,
+					retirementState.totalCandidates,
+					purgedCount,
+					retirementState.totalProcessed,
+					time.Since(start),
+				)
+			}
+
+			retirementState.Unlock()
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
 	statsInterval, err := be.Housekeeping.Config.ParseProjectStatsRefreshInterval()
 	if err != nil {
 		return err

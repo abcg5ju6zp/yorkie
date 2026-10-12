@@ -389,11 +389,25 @@ func TestDocument(t *testing.T) {
 		assert.NoError(t, c1.Attach(ctx, d1))
 		assert.NoError(t, c1.Remove(ctx, d1))
 
-		// 02. cli2 creates d2 with the same key.
+		// 02. While the retired generation is retained, neither client can
+		// create a document with the same key.
 		d2 := document.New(helper.TestKey(t))
+		assert.ErrorContains(t, c2.Attach(ctx, d2), "document is removed")
+
+		// 03. After the generation is purged, the key is reusable and both
+		// clients converge on a fresh document.
+		project, err := defaultServer.DefaultProject(ctx)
+		assert.NoError(t, err)
+		retired, err := defaultServer.Backend().DB.FindRetiredDocInfoByKey(
+			ctx, project.ID, helper.TestKey(t),
+		)
+		assert.NoError(t, err)
+		_, err = defaultServer.Backend().DB.PurgeDocument(ctx, retired.RefKey())
+		assert.NoError(t, err)
+
+		d2 = document.New(helper.TestKey(t))
 		assert.NoError(t, c2.Attach(ctx, d2))
 
-		// 03. cli1 creates d3 with the same key.
 		d3 := document.New(helper.TestKey(t))
 		assert.NoError(t, c1.Attach(ctx, d3))
 		syncClientsThenAssertEqual(t, []clientAndDocPair{{c1, d3}, {c2, d2}})

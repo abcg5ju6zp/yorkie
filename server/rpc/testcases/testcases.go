@@ -279,25 +279,20 @@ func RunAttachAndDetachRemovedDocumentTest(
 	assert.Equal(t, connect.CodeFailedPrecondition, connect.CodeOf(err))
 	assert.Equal(t, database.ErrDocumentNotAttached.Code(), converter.ErrorCodeOf(err))
 
-	// try to create new document with same key as removed document
-	resPack, err = testClient.AttachDocument(
+	// try to create a new document with the same key while the removed
+	// generation is retained: rejected rather than silently starting a new
+	// generation that late pushes or the deferred purge could confuse with
+	// the retired one. The key becomes reusable again only after the
+	// generation is purged.
+	_, err = testClient.AttachDocument(
 		context.Background(),
 		connect.NewRequest(&api.AttachDocumentRequest{
 			ClientId:   activateResp.Msg.ClientId,
 			ChangePack: packWithNoChanges,
 		},
 		))
-	assert.NoError(t, err)
-
-	_, err = testClient.RemoveDocument(
-		context.Background(),
-		connect.NewRequest(&api.RemoveDocumentRequest{
-			ClientId:   activateResp.Msg.ClientId,
-			DocumentId: resPack.Msg.DocumentId,
-			ChangePack: packWithRemoveRequest,
-		},
-		))
-	assert.NoError(t, err)
+	assert.Equal(t, connect.CodeFailedPrecondition, connect.CodeOf(err))
+	assert.Equal(t, database.ErrDocumentRetired.Code(), converter.ErrorCodeOf(err))
 }
 
 // RunPushPullChangeTest runs the PushChange and PullChange test.
@@ -461,17 +456,34 @@ func RunPushPullChangeOnRemovedDocumentTest(
 		))
 	assert.NoError(t, err)
 
-	// try to push/pull on removed document
-	_, err = testClient.PushPullChanges(
+	// push/pull against the retired generation still succeeds: the client
+	// receives the removed flag so it can recognize the deletion while the
+	// generation is retained, instead of failing forever. The call is
+	// idempotent across retries.
+	for i := 0; i < 2; i++ {
+		pulled, err := testClient.PushPullChanges(
+			context.Background(),
+			connect.NewRequest(&api.PushPullChangesRequest{
+				ClientId:   activateResp.Msg.ClientId,
+				DocumentId: resPack.Msg.DocumentId,
+				ChangePack: packWithNoChanges,
+			},
+			))
+		assert.NoError(t, err)
+		assert.True(t, pulled.Msg.ChangePack.IsRemoved)
+	}
+
+	// A same-key attach, however, is refused while the generation is
+	// retained.
+	_, err = testClient.AttachDocument(
 		context.Background(),
-		connect.NewRequest(&api.PushPullChangesRequest{
+		connect.NewRequest(&api.AttachDocumentRequest{
 			ClientId:   activateResp.Msg.ClientId,
-			DocumentId: resPack.Msg.DocumentId,
 			ChangePack: packWithNoChanges,
 		},
 		))
 	assert.Equal(t, connect.CodeFailedPrecondition, connect.CodeOf(err))
-	assert.Equal(t, database.ErrDocumentNotAttached.Code(), converter.ErrorCodeOf(err))
+	assert.Equal(t, database.ErrDocumentRetired.Code(), converter.ErrorCodeOf(err))
 }
 
 // RunRemoveDocumentTest runs the RemoveDocument test.

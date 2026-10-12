@@ -19,6 +19,7 @@ package rpc
 import (
 	"context"
 	stderrors "errors"
+	"fmt"
 	"sync"
 	gotime "time"
 
@@ -890,6 +891,13 @@ func (s *yorkieServer) resolveDocument(
 		return watchTarget{}, err
 	}
 
+	// A retired generation does not accept new Watches. The reconnecting
+	// stream gets the removed result instead of staying open against a
+	// document whose changes are about to be purged.
+	if docInfo.IsRemoved() {
+		return watchTarget{}, fmt.Errorf("watch document %s: %w", docID, database.ErrDocumentRetired)
+	}
+
 	return watchTarget{docInfo: docInfo}, nil
 }
 
@@ -1668,6 +1676,15 @@ func (s *yorkieServer) DetachDocument(
 		return nil, ErrDocumentKeyMismatch
 	}
 
+	// An explicit detach requires an attached or attaching copy, so a retry
+	// after the client already detached (or after a retired generation
+	// converged the row) reports ErrDocumentNotAttached instead of silently
+	// succeeding. The server-driven deactivation fan-out bypasses this
+	// handler and converges idempotently instead.
+	if err := clientInfo.EnsureDocumentAttachedOrAttaching(docID); err != nil {
+		return nil, err
+	}
+
 	// 04. Push/Pull between the client and server.
 	pulled, err := packs.PushPull(ctx, s.backend, project, clientInfo, docKey, pack, packs.PushPullOptions{
 		Mode:            types.SyncModePushPull,
@@ -1687,6 +1704,17 @@ func (s *yorkieServer) DetachDocument(
 	// the response is built: the row MongoDB holds has already moved on, so
 	// any step failing in between must not leave the peers' copies behind.
 	clients.InvalidateCachedClient(ctx, s.backend, clientInfo.RefKey())
+
+	// 06. A RemoveOnDetach detach that was the last attachment claims the
+	// document's retirement generation; converge its Watches like any other
+	// removal so a disconnected Watch cannot keep serving the retired copy.
+	if pulled.IsRemoved {
+		if retired, convErr := documents.FindDocInfoByRefKey(ctx, s.backend, docKey); convErr != nil {
+			logging.From(ctx).Warnf("load retired document %s: %v", docKey, convErr)
+		} else if convErr := documents.ConvergeRetiredDocument(ctx, s.backend, retired); convErr != nil {
+			logging.From(ctx).Warnf("converge retired document %s: %v", docKey, convErr)
+		}
+	}
 
 	pbChangePack, err := pulled.ToPBChangePack()
 	if err != nil {
@@ -1744,12 +1772,7 @@ func (s *yorkieServer) PushPullChanges(
 		return nil, err
 	}
 
-	// 02. Ensure the document attached to the client.
-	if err := clientInfo.EnsureDocumentAttached(docID); err != nil {
-		return nil, err
-	}
-
-	// 03. Read the document's disable_presence option so PushPull can
+	// 02. Read the document's disable_presence option so PushPull can
 	// enforce it. FindDocInfoByRefKey hits the LRU cache for warm docs.
 	docKey := types.DocRefKey{ProjectID: project.ID, DocID: docID}
 	docInfo, err := documents.FindDocInfoByRefKey(ctx, s.backend, docKey)
@@ -1758,6 +1781,17 @@ func (s *yorkieServer) PushPullChanges(
 	}
 	if docInfo.Key != pack.DocumentKey {
 		return nil, ErrDocumentKeyMismatch
+	}
+
+	// 03. A live document requires an attached client. A retired generation
+	// is served instead: the watcher whose row the server already converged
+	// must still sync once to receive the removed flag, and PushPull below
+	// converges the row idempotently (a client that never held the document
+	// still errors there).
+	if !docInfo.IsRemoved() {
+		if err := clientInfo.EnsureDocumentAttached(docID); err != nil {
+			return nil, err
+		}
 	}
 
 	// 04. Push/Pull between the client and server.
@@ -1854,6 +1888,15 @@ func (s *yorkieServer) RemoveDocument(
 		return nil, ErrDocumentKeyMismatch
 	}
 
+	// The client-driven remove requires an attached (or attaching) copy: a
+	// second remove of the same generation, a detached copy, or a stale client
+	// must all report ErrDocumentNotAttached before any work happens. The
+	// server-side retirement convergence below never goes through this
+	// guard.
+	if err := clientInfo.EnsureDocumentAttachedOrAttaching(docID); err != nil {
+		return nil, err
+	}
+
 	// 03. Push/Pull between the client and server.
 	pulled, err := packs.PushPull(ctx, s.backend, project, clientInfo, docKey, pack, packs.PushPullOptions{
 		Mode:            types.SyncModePushPull,
@@ -1869,6 +1912,17 @@ func (s *yorkieServer) RemoveDocument(
 	// same reason it sits directly after the write rather than after the
 	// response is built.
 	clients.InvalidateCachedClient(ctx, s.backend, clientInfo.RefKey())
+
+	// 05. Converge the rest of the generation: force-remove other attached
+	// clients and close its Watches cluster-wide. The removal itself is
+	// already durable, so convergence is best-effort here and retried by
+	// repeat removals and by housekeeping. Keyed by the generation's DocID,
+	// it never reaches a same-key document created after a later purge.
+	if retired, convErr := documents.FindDocInfoByRefKey(ctx, s.backend, docKey); convErr != nil {
+		logging.From(ctx).Warnf("load retired document %s: %v", docKey, convErr)
+	} else if convErr := documents.ConvergeRetiredDocument(ctx, s.backend, retired); convErr != nil {
+		logging.From(ctx).Warnf("converge retired document %s: %v", docKey, convErr)
+	}
 
 	pbChangePack, err := pulled.ToPBChangePack()
 	if err != nil {

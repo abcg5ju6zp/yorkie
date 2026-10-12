@@ -42,6 +42,15 @@ type Config struct {
 	// ProjectStatsRefreshInterval is the interval between project-stats refresh cycles.
 	// If empty or "0s", the project-stats refresh task is not registered.
 	ProjectStatsRefreshInterval string `yaml:"ProjectStatsRefreshInterval"`
+
+	// RetirementRetentionInterval is how long a removed document's
+	// retirement generation is kept after removal before its changes,
+	// snapshots, version vectors and document row are purged. During the
+	// window the generation is queryable and retains the last server
+	// sequence, snapshot and version vector, so offline clients can still
+	// recognize the deletion. If empty or "0s", the deferred purge task is
+	// not registered and generations are retained until a manual purge.
+	RetirementRetentionInterval string `yaml:"RetirementRetentionInterval"`
 }
 
 // Validate validates the configuration.
@@ -92,6 +101,23 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if c.RetirementRetentionInterval != "" {
+		d, err := time.ParseDuration(c.RetirementRetentionInterval)
+		if err != nil {
+			return fmt.Errorf(
+				`invalid argument %s for "--housekeeping-retirement-retention-interval" flag: %w`,
+				c.RetirementRetentionInterval,
+				err,
+			)
+		}
+		if d < 0 {
+			return fmt.Errorf(
+				`invalid argument %s for "--housekeeping-retirement-retention-interval" flag: must be >= 0`,
+				c.RetirementRetentionInterval,
+			)
+		}
+	}
+
 	return nil
 }
 
@@ -114,13 +140,32 @@ func (c *Config) ParseProjectStatsRefreshInterval() (time.Duration, error) {
 	if err != nil {
 		return 0, fmt.Errorf(
 			`invalid argument %s for "--housekeeping-project-stats-refresh-interval" flag: %w`,
-			c.ProjectStatsRefreshInterval, err,
+			c.ProjectStatsRefreshInterval,
+			err,
 		)
 	}
 	if d < 0 {
 		return 0, fmt.Errorf(
 			`invalid argument %s for "--housekeeping-project-stats-refresh-interval" flag: must be >= 0`,
 			c.ProjectStatsRefreshInterval,
+		)
+	}
+	return d, nil
+}
+
+// ParseRetirementRetentionInterval parses the configured retention interval
+// of a retired document generation. Returns 0 when unset, which disables the
+// deferred purge task; an explicit "0s" also disables it.
+func (c *Config) ParseRetirementRetentionInterval() (time.Duration, error) {
+	if c.RetirementRetentionInterval == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.RetirementRetentionInterval)
+	if err != nil {
+		return 0, fmt.Errorf(
+			`invalid argument %s for "--housekeeping-retirement-retention-interval" flag: %w`,
+			c.RetirementRetentionInterval,
+			err,
 		)
 	}
 	return d, nil

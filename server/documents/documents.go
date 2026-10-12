@@ -531,27 +531,29 @@ func UpdateDocument(
 	}, nil
 }
 
-// RemoveDocument removes the given document. If force is false, it only removes
-// the document if it is not attached to any client.
+// RemoveDocument removes the given document as a queryable retirement
+// generation. If force is false, it keeps the wait policy and fails while the
+// document is attached or attaching to another client; force converges
+// attachments immediately. See RetireDocument for the generation semantics.
 func RemoveDocument(
 	ctx context.Context,
 	be *backend.Backend,
 	refKey types.DocRefKey,
 	force bool,
 ) error {
-	if force {
-		return be.DB.UpdateDocInfoStatusToRemoved(ctx, refKey)
-	}
+	_, err := RetireDocument(ctx, be, refKey, force)
+	return err
+}
 
-	isAttached, err := be.DB.IsDocumentAttachedOrAttaching(ctx, refKey, "")
-	if err != nil {
-		return err
-	}
-	if isAttached {
-		return fmt.Errorf("remove document %s: %w", refKey, packs.ErrDocumentAttached)
-	}
-
-	return be.DB.UpdateDocInfoStatusToRemoved(ctx, refKey)
+// FindRetiredDocInfoByKey returns the retired (removed but not yet purged)
+// document generation for the given key, if one exists.
+func FindRetiredDocInfoByKey(
+	ctx context.Context,
+	be *backend.Backend,
+	projectID types.ID,
+	docKey key.Key,
+) (*database.DocInfo, error) {
+	return be.DB.FindRetiredDocInfoByKey(ctx, projectID, docKey)
 }
 
 // IsDocumentAttachedOrAttaching returns true if the given document is attached or attaching to any client.

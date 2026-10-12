@@ -185,6 +185,58 @@ func (m *PubSub) ClientIDs(docKey types.DocRefKey) []time.ActorID {
 	return ids
 }
 
+// CloseDocument delivers a final DocChanged event to every Watch subscribed
+// to the given document on this node and then ends those streams and removes
+// the subscription table. It is the local half of retirement convergence:
+// once a document's removal generation is claimed, no Watch may stay open
+// against it.
+//
+// The final event is sent directly into each subscription's buffer rather
+// than through the batched publisher, so closing the subscriptions cannot
+// race the removal event out of delivery: a Watcher still gets one chance to
+// sync and observe the removed flag before its stream closes. The closed
+// streams then finish with ErrSubscriptionsClosed; their re-resolution finds
+// the retired generation (or a rejection) instead of silently keeping the old
+// copy. Idempotent: a document with no subscriptions is a no-op.
+func (m *PubSub) CloseDocument(_ context.Context, docKey types.DocRefKey) int {
+	subs, ok := m.docSubsMap.Get(docKey)
+	if !ok {
+		return 0
+	}
+
+	final := events.DocEvent{
+		Type:  events.DocChanged,
+		Actor: time.InitialActorID,
+		Key:   docKey,
+	}
+
+	closed := 0
+	for _, sub := range subs.Values() {
+		// Best-effort direct delivery into the one-entry buffer; a consumer
+		// that cannot accept in time reconnects into the removed result.
+		sub.Publish(final)
+		sub.Close()
+		closed++
+	}
+
+	// Remove the table only if it is still the instance we drained, so a
+	// subscription created concurrently gets a fresh table instead of a
+	// closed one.
+	m.docSubsMap.Delete(docKey, func(current *DocSubscriptions, exists bool) bool {
+		if !exists || current != subs {
+			return false
+		}
+		current.Close()
+		return true
+	})
+
+	if logging.Enabled(zap.DebugLevel) {
+		logging.DefaultLogger().Debugf(`CloseDocument(%s) closed %d subscriptions`, docKey, closed)
+	}
+
+	return closed
+}
+
 // SubscribeChannel subscribes to the given channel key.
 func (m *PubSub) SubscribeChannel(
 	ctx context.Context,
