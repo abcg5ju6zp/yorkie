@@ -18,6 +18,7 @@ package projects
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/yorkie-team/yorkie/api/types"
@@ -28,6 +29,12 @@ import (
 
 const (
 	statsRefreshKey = "housekeeping/project-stats-refresh"
+
+	// statsUnitTimeout bounds refreshing a single project after the cycle
+	// context is cancelled. A project already in hand finishes both counts
+	// and the stats write as one complete publication; the timeout keeps the
+	// detached work bounded.
+	statsUnitTimeout = 15 * time.Second
 )
 
 // RefreshStats walks projects in cursor order, counts activated clients and
@@ -36,15 +43,26 @@ const (
 //
 // Returns the new cursor position and the number of projects processed.
 //
-// The cursor advances to the tail of the fetched batch even when individual
-// projects fail (errors are logged and the project is skipped), so a single
-// bad project cannot stall subsequent refreshes.
+// Per-project failures are logged and the project is skipped, so a single bad
+// project cannot stall subsequent refreshes in the same cycle.
+//
+// On a shutdown signal the cycle stops claiming new projects, the in-hand
+// project still publishes its complete count pair, and the cursor is held at
+// the last fully refreshed project rather than advanced to the batch tail;
+// unprocessed projects are left for the next cycle. Partial counts are never
+// written because the stats update follows both counts.
 func RefreshStats(
 	ctx context.Context,
 	be *backend.Backend,
 	limit int,
 	lastProjectID types.ID,
 ) (types.ID, int, error) {
+	// Shutdown has already begun: do not claim the cycle lock, page projects
+	// or touch any resource.
+	if ctx.Err() != nil {
+		return lastProjectID, 0, nil
+	}
+
 	locker, ok := be.Lockers.LockerWithTryLock(statsRefreshKey)
 	if !ok {
 		return lastProjectID, 0, nil
@@ -61,23 +79,54 @@ func RefreshStats(
 	}
 
 	processed := 0
+	committedCursor := lastProjectID
+
 	for _, p := range projects {
-		cc, err := be.DB.CountActivatedClients(ctx, p.ID)
+		// Stop claiming new projects as soon as shutdown begins.
+		if ctx.Err() != nil {
+			return committedCursor, processed, nil
+		}
+
+		// Detach the in-hand project from the cycle signal so its two counts
+		// and update converge into one complete publication instead of
+		// leaving partial counts behind.
+		unitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), statsUnitTimeout)
+		err := refreshOneProject(unitCtx, be, p.ID)
+		cancel()
+
 		if err != nil {
-			logging.From(ctx).Warnf("count activated clients %s: %v", p.ID, err)
-			continue
+			logging.From(ctx).Warnf("refresh project stats %s: %v", p.ID, err)
+		} else {
+			processed++
+			committedCursor = p.ID
 		}
-		dc, err := be.DB.CountAliveDocuments(ctx, p.ID)
-		if err != nil {
-			logging.From(ctx).Warnf("count alive documents %s: %v", p.ID, err)
-			continue
+
+		// After the in-hand project settles, honour a signal observed while it
+		// was running: hold the cursor at the last completed project.
+		if ctx.Err() != nil {
+			return committedCursor, processed, nil
 		}
-		if err := be.DB.UpdateProjectStats(ctx, p.ID, cc, dc, time.Now()); err != nil {
-			logging.From(ctx).Warnf("update project stats %s: %v", p.ID, err)
-			continue
-		}
-		processed++
 	}
 
+	// Full batch drained: advance to the batch tail as before.
 	return tailID, processed, nil
+}
+
+// refreshOneProject counts the project's clients and documents and publishes
+// both values in one stats update. It returns an error if either count fails,
+// in which case nothing is written, so a project can never publish partial
+// counts.
+func refreshOneProject(ctx context.Context, be *backend.Backend, projectID types.ID) error {
+	cc, err := be.DB.CountActivatedClients(ctx, projectID)
+	if err != nil {
+		return fmt.Errorf("count activated clients %s: %w", projectID, err)
+	}
+	dc, err := be.DB.CountAliveDocuments(ctx, projectID)
+	if err != nil {
+		return fmt.Errorf("count alive documents %s: %w", projectID, err)
+	}
+	if err := be.DB.UpdateProjectStats(ctx, projectID, cc, dc, time.Now()); err != nil {
+		return fmt.Errorf("update project stats %s: %w", projectID, err)
+	}
+	return nil
 }

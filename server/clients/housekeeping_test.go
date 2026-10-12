@@ -167,6 +167,52 @@ func TestDispatchDeactivate_NoCandidates(t *testing.T) {
 	}
 }
 
+// TestDeactivateInactives_ShutdownBeforeStart verifies that once the shutdown
+// signal has landed the cycle takes nothing: it does not touch the database or
+// the cycle lock and returns the input cursor so the page is rescanned by the
+// next cycle (or the next leader term after restart).
+func TestDeactivateInactives_ShutdownBeforeStart(t *testing.T) {
+	be := &backend.Backend{
+		Lockers: yorkiesync.New(),
+	}
+	inputLastID := types.ID("aaaaaaaaaaaaaaaaaaaaaaaa")
+
+	ctx, cancel := context.WithCancel(testCtx())
+	cancel()
+
+	outLastID, candidatesCount, processedCount, err := DeactivateInactives(
+		ctx, be, 500, 8, inputLastID,
+	)
+
+	assert.NoError(t, err)
+	assert.Equal(t, inputLastID, outLastID,
+		"shutdown must not wrap or advance the cursor")
+	assert.Equal(t, 0, candidatesCount)
+	assert.Equal(t, 0, processedCount)
+}
+
+// TestDispatchDeactivate_InFlightCandidateDrainsOnCancel verifies the
+// shutdown contract for the sequential path: once a candidate has been
+// claimed, its deactivation completes and is counted even if the cycle signal
+// lands while it runs, but no following candidate is claimed.
+func TestDispatchDeactivate_InFlightCandidateDrainsOnCancel(t *testing.T) {
+	candidates := makeCandidates(10)
+	ctx, cancel := context.WithCancel(testCtx())
+
+	var calls atomic.Int32
+	count := dispatchDeactivate(ctx, candidates, 1, func(c CandidatePair) error {
+		n := calls.Add(1)
+		if n == 1 {
+			// Signal shutdown while the first candidate is still in hand.
+			cancel()
+		}
+		return nil
+	})
+
+	assert.Equal(t, int32(1), calls.Load(), "the in-flight candidate finishes; no new claim")
+	assert.Equal(t, 1, count, "a completed in-flight candidate is confirmed")
+}
+
 // TestDeactivateInactives_SkipsWhenLockHeld verifies the concurrent-cycle
 // contract: when a prior housekeeping tick is still holding the deactivation
 // lock, an overlapping tick observes the busy lock via TryLock and returns

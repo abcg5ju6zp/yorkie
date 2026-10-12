@@ -334,7 +334,7 @@ func (r *Yorkie) RegisterHousekeepingTasks(be *backend.Backend) error {
 		interval, be.Housekeeping.Config.CandidatesLimit, deactivateConcurrency,
 	)
 
-	if err = be.Housekeeping.RegisterTask(interval, func(ctx context.Context) error {
+	if err = be.Housekeeping.RegisterTask("deactivation", interval, func(ctx context.Context) error {
 		deactivateState.Lock()
 		currentLastID := deactivateState.lastID
 		deactivateState.Unlock()
@@ -382,7 +382,7 @@ func (r *Yorkie) RegisterHousekeepingTasks(be *backend.Backend) error {
 		return err
 	}
 
-	if err := be.Housekeeping.RegisterTask(interval, func(ctx context.Context) error {
+	if err := be.Housekeeping.RegisterTask("compaction", interval, func(ctx context.Context) error {
 		compactionState.Lock()
 		currentLastServerSeq := compactionState.lastServerSeq
 		currentLastID := compactionState.lastID
@@ -438,7 +438,7 @@ func (r *Yorkie) RegisterHousekeepingTasks(be *backend.Backend) error {
 		return err
 	}
 	if statsInterval > 0 {
-		if err := be.Housekeeping.RegisterTask(statsInterval, func(ctx context.Context) error {
+		if err := be.Housekeeping.RegisterTask("project-stats", statsInterval, func(ctx context.Context) error {
 			statsState.Lock()
 			currentLastID := statsState.lastID
 			statsState.Unlock()

@@ -75,6 +75,51 @@ func TestRefreshStats(t *testing.T) {
 	}
 }
 
+// TestRefreshStatsShutdownHoldsCursor verifies that a cancelled cycle claims
+// nothing and returns its input cursor: unprocessed projects are left for the
+// next cycle, and no partial stats publication occurs.
+func TestRefreshStatsShutdownHoldsCursor(t *testing.T) {
+	be := newTestBackend(t)
+	ctx := context.Background()
+
+	// Create 3 projects.
+	for i := range 3 {
+		_, err := be.DB.CreateProjectInfo(ctx, fmt.Sprintf("%s-p%d", t.Name(), i), testOwnerID)
+		assert.NoError(t, err)
+	}
+
+	input := database.ZeroID
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+
+	lastID, processed, err := projects.RefreshStats(cancelled, be, 10, input)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, processed)
+	assert.Equal(t, input, lastID, "interrupted cycle must not advance the cursor")
+
+	// A following cycle resumes from the held cursor and processes all
+	// projects, proving no project is skipped across shutdown/restart.
+	resumeID, resumed, err := projects.RefreshStats(ctx, be, 10, lastID)
+	assert.NoError(t, err)
+	assert.Equal(t, 3, resumed)
+	assert.NotEqual(t, database.ZeroID, resumeID)
+}
+
+// TestRefreshStatsShutdownBeforeLock verifies the earliest signal boundary:
+// with the signal already present, the cycle does not even page projects.
+func TestRefreshStatsShutdownBeforeLock(t *testing.T) {
+	be := newTestBackend(t)
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	input := types.ID("bbbbbbbbbbbbbbbbbbbbbbbb")
+	lastID, processed, err := projects.RefreshStats(cancelled, be, 10, input)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, processed)
+	assert.Equal(t, input, lastID)
+}
+
 func TestRefreshStatsPaginationWrap(t *testing.T) {
 	ctx := context.Background()
 	be := newTestBackend(t)

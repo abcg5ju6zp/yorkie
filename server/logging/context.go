@@ -31,12 +31,12 @@ func With(ctx context.Context, logger Logger) context.Context {
 // From returns the logger stored in the provided context.
 func From(ctx context.Context) Logger {
 	if ctx == nil {
-		return defaultLogger
+		return DefaultLogger()
 	}
 
 	logger, ok := ctx.Value(loggerKey{}).(Logger)
 	if !ok {
-		return defaultLogger
+		return DefaultLogger()
 	}
 
 	return logger

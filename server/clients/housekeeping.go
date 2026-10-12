@@ -32,6 +32,13 @@ import (
 
 const (
 	deactivationKey = "housekeeping/deactivation"
+
+	// deactivationUnitTimeout bounds the convergence of a single candidate
+	// after the cycle context is cancelled. A candidate already in hand must
+	// finish its detach fan-out, cache-invalidation broadcast and conditional
+	// DB write; detaching the context keeps that sequence alive while the
+	// timeout keeps it bounded so it cannot outlive shutdown indefinitely.
+	deactivationUnitTimeout = 30 * time.Second
 )
 
 // CandidatePair represents a pair of Project and Client.
@@ -61,6 +68,12 @@ func DeactivateInactives(
 	concurrency int,
 	lastClientID types.ID,
 ) (types.ID, int, int, error) {
+	// Shutdown has already begun: do not claim the cycle lock, query for
+	// candidates or touch any resource.
+	if ctx.Err() != nil {
+		return lastClientID, 0, 0, nil
+	}
+
 	locker, ok := be.Lockers.LockerWithTryLock(deactivationKey)
 	if !ok {
 		return lastClientID, 0, 0, nil
@@ -84,6 +97,16 @@ func DeactivateInactives(
 
 	deactivatedCount := deactivateCandidates(ctx, be, candidates, concurrency)
 
+	// A shutdown signal stopped the cycle before every candidate was claimed.
+	// In-flight candidates have converged on detached unit contexts, but the
+	// rest were never started: hold the cursor at its input position so the
+	// next cycle rescans the page. Confirmed deactivations cannot be advanced
+	// twice because FindActiveClients only returns active rows and the update
+	// itself is conditional on the client still being active.
+	if ctx.Err() != nil {
+		return lastClientID, len(candidates), deactivatedCount, nil
+	}
+
 	return lastID, len(candidates), deactivatedCount, nil
 }
 
@@ -98,9 +121,26 @@ func deactivateCandidates(
 	concurrency int,
 ) int {
 	return dispatchDeactivate(ctx, candidates, concurrency, func(c CandidatePair) error {
-		_, err := Deactivate(ctx, be, c.Project, c.Client.RefKey())
-		return err
+		return deactivateCandidate(ctx, be, c)
 	})
+}
+
+// deactivateCandidate deactivates a single already-claimed candidate. It runs
+// on a context detached from the cycle's shutdown signal: once dispatch has
+// handed a candidate to this function, the client's document detachments, the
+// cluster cache-invalidation broadcast and the conditional DB status write
+// must converge together instead of being cancelled halfway through. The
+// timeout keeps the detached work bounded for shutdown.
+func deactivateCandidate(
+	ctx context.Context,
+	be *backend.Backend,
+	c CandidatePair,
+) error {
+	unitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deactivationUnitTimeout)
+	defer cancel()
+
+	_, err := Deactivate(unitCtx, be, c.Project, c.Client.RefKey())
+	return err
 }
 
 // dispatchDeactivate runs `deactivate` for each candidate. With concurrency

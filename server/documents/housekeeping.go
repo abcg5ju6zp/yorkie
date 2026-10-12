@@ -18,6 +18,7 @@ package documents
 
 import (
 	"context"
+	"time"
 
 	"github.com/yorkie-team/yorkie/api/types"
 	"github.com/yorkie-team/yorkie/server/backend"
@@ -27,6 +28,13 @@ import (
 
 const (
 	compactionKey = "housekeeping/compaction"
+
+	// compactionUnitTimeout bounds the compaction of a single document after
+	// the cycle context is cancelled. A document already in hand either
+	// completes (claim, compacted change and purge all land) or keeps its last
+	// readable snapshot and untrimmed changes (the claim is rolled back by the
+	// database layer); the timeout keeps that detached work bounded.
+	compactionUnitTimeout = 30 * time.Second
 )
 
 // CandidatePairDoc represents a pair of Project and Document.
@@ -45,6 +53,12 @@ func CompactDocuments(
 	lastServerSeq int64,
 	lastDocID types.ID,
 ) (int64, types.ID, int, int, error) {
+	// Shutdown has already begun: do not claim the cycle lock, query for
+	// candidates or touch any resource.
+	if ctx.Err() != nil {
+		return lastServerSeq, lastDocID, 0, 0, nil
+	}
+
 	locker, ok := be.Lockers.LockerWithTryLock(compactionKey)
 	if !ok {
 		return lastServerSeq, lastDocID, 0, 0, nil
@@ -68,20 +82,89 @@ func CompactDocuments(
 		return 0, database.ZeroID, 0, 0, nil
 	}
 
+	seq, id, attempted, compactedCount := compactCandidates(
+		ctx,
+		lastServerSeq,
+		lastDocID,
+		candidates,
+		func(unitCtx context.Context, pair CandidatePairDoc) (bool, error) {
+			return CompactDocument(unitCtx, be, pair.Project, pair.Document, false)
+		},
+	)
+
+	// When the cycle ran to the end, the cursor is the tail of the fetched
+	// batch, as before. An interrupted cycle returns the position
+	// compactCandidates held at, which never passes an unsettled document.
+	if ctx.Err() == nil {
+		seq, id = resultServerSeq, resultDocID
+	}
+
+	return seq, id, attempted, compactedCount, nil
+}
+
+// compactCandidates walks the candidates one document at a time under the
+// cycle context and compacts each on a detached, bounded unit context.
+//
+// Safe boundaries on shutdown:
+//   - Before a document is claimed, a cancelled cycle context stops the loop,
+//     so that document keeps its last readable snapshot and untrimmed changes.
+//   - A document already claimed runs to completion detached from the signal;
+//     the claim/settle logic in the database layer rolls back an interrupted
+//     write, so the outcome is either a complete compaction or the untouched
+//     document.
+//
+// The returned cursor only advances past settled documents: on interruption
+// it stops at the last settled one, leaving the in-hand document (when its
+// result is uncertain) for the next cycle. The conditional server_seq claim
+// makes retrying an already-finished document harmless.
+func compactCandidates(
+	ctx context.Context,
+	lastServerSeq int64,
+	lastDocID types.ID,
+	candidates []CandidatePairDoc,
+	compactOne func(context.Context, CandidatePairDoc) (bool, error),
+) (int64, types.ID, int, int) {
+	committedServerSeq := lastServerSeq
+	committedDocID := lastDocID
+	attempted := 0
 	compactedCount := 0
+
 	for _, pair := range candidates {
-		compacted, err := CompactDocument(ctx, be, pair.Project, pair.Document, false)
+		// Stop claiming new documents as soon as shutdown begins.
+		if ctx.Err() != nil {
+			break
+		}
+		attempted++
+
+		unitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), compactionUnitTimeout)
+		compacted, err := compactOne(unitCtx, pair)
+		cancel()
+
 		if err != nil {
+			// The signal raced the in-hand document: its claim may still be
+			// settling, so hold the cursor before it rather than report it as
+			// done. Outside shutdown this is an ordinary per-document failure:
+			// log and move on, as before.
+			if ctx.Err() != nil {
+				logging.From(ctx).Warnf(
+					"interrupted while compacting document %s: %v", pair.Document.ID, err)
+				break
+			}
 			logging.From(ctx).Warnf("failed to compact document %s: %v", pair.Document.ID, err)
-			continue
 		}
 
 		if compacted {
 			compactedCount++
 		}
+		committedServerSeq = pair.Document.ServerSeq
+		committedDocID = pair.Document.ID
+
+		if ctx.Err() != nil {
+			break
+		}
 	}
 
-	return resultServerSeq, resultDocID, len(candidates), compactedCount, nil
+	return committedServerSeq, committedDocID, attempted, compactedCount
 }
 
 // FindCompactionCandidates finds candidates to compact by directly querying documents.
